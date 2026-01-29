@@ -24,13 +24,13 @@ func SetupLogger() {
 	}
 	_ = os.MkdirAll(configDir, 0755)
 	logPath := filepath.Join(configDir, "app.log")
-	
+
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	var w io.Writer = os.Stderr
 	if err == nil {
 		w = io.MultiWriter(os.Stderr, f)
 	}
-	
+
 	opts := &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}
@@ -43,14 +43,14 @@ func GoLogCallback(level int, text *C.char) {
 	if Logger == nil {
 		return
 	}
-	
+
 	msg := C.GoString(text)
-	msg = strings.TrimSpace(msg) // Remove trailing newlines
+	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return
 	}
 
-	// Map llama.cpp levels (heuristic, as enum is not easily available without including header here)
+	// Map llama.cpp levels
 	// 1=Error, 2=Warn, 3=Info, 4=Debug usually.
 	switch level {
 	case 1: // GGML_LOG_LEVEL_ERROR

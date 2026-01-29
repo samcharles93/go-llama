@@ -30,7 +30,7 @@ func (b *Batch) Clear() {
 
 func (b *Batch) Add(token Token, pos int32, seqIDs []int32, logits bool) {
 	idx := b.batch.n_tokens
-	
+
 	// Set token
 	tokens := (*[1 << 30]C.llama_token)(unsafe.Pointer(b.batch.token))
 	tokens[idx] = C.llama_token(token)
@@ -46,12 +46,6 @@ func (b *Batch) Add(token Token, pos int32, seqIDs []int32, logits bool) {
 	// Set seq_id
 	seqIDPtrs := (*[1 << 30]*C.llama_seq_id)(unsafe.Pointer(b.batch.seq_id))
 	for i, sid := range seqIDs {
-		// This is a bit unsafe as we are accessing the pointer directly. 
-		// llama_batch_init allocates sequential memory for seq_id[i]. 
-		// We need to trust the layout or write a C helper. 
-		// For now, let's assume the standard layout: seq_id[idx][i]
-		// Actually, let's use a C helper function to be safe and clean.
-		// But for now, let's implement the array access carefully.
 		currentSeqIDArr := (*[1 << 30]C.llama_seq_id)(unsafe.Pointer(seqIDPtrs[idx]))
 		currentSeqIDArr[i] = C.llama_seq_id(sid)
 	}
