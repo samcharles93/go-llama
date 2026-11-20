@@ -39,13 +39,18 @@ type server struct {
 	maxBody  int64
 	queued   atomic.Int64
 
-	// Embeddings run on their own context: a context created with Embeddings
-	// enabled clears its KV cache on every call and cannot serve chat traffic.
-	embedMu      sync.Mutex
-	embedCtx     *llama.Context
-	embedErr     error
-	embedPool    llama.PoolingType
-	embedCtxSize uint32
+	// Embeddings run on their own model and context: a context created with
+	// Embeddings enabled clears its KV cache on every call and cannot serve chat
+	// traffic, and a chat model's pooled hidden states are not semantic
+	// embeddings.
+	embedModel          *llama.Model
+	allowChatEmbeddings bool
+	embedMu             sync.Mutex
+	embedCtx            *llama.Context
+	embedErr            error
+	embedPool           llama.PoolingType
+	embedCtxSize        uint32
+	embedBatch          int
 
 	base       context.Context
 	cancelBase context.CancelFunc
@@ -273,7 +278,7 @@ func (sc *streamScope) send(frame any) bool {
 }
 
 func (sc *streamScope) done() {
-	fmt.Fprint(sc.w, "data: [DONE]\n\n")
+	_, _ = fmt.Fprint(sc.w, "data: [DONE]\n\n")
 	sc.flusher.Flush()
 }
 
@@ -332,7 +337,7 @@ func (s *server) writeErrorFor(w http.ResponseWriter, err error) {
 	}
 }
 
-func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelList{
 		Object: "list",
 		Data: []modelCard{{
@@ -344,7 +349,7 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	busy := cap(s.pool) - len(s.pool)
 	writeJSON(w, http.StatusOK, healthBody{
 		Status:   "ok",
@@ -549,6 +554,12 @@ func (s *server) streamCompletions(w http.ResponseWriter, r *http.Request, promp
 	}
 }
 
+// embedErr carries the first failure out of the batching loop.
+type embedErr struct{ err error }
+
+func (e embedErr) Error() string { return e.err.Error() }
+func (e embedErr) Unwrap() error { return e.err }
+
 func (s *server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	var req embeddingsRequest
 	if !s.decodeJSON(w, r, &req) {
@@ -567,15 +578,32 @@ func (s *server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	// Embeddings enabled clears its cache on every call.
 	c, err := s.embeddingContext()
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "embeddings_unavailable",
-			"the loaded model cannot produce embeddings: "+err.Error())
+		writeError(w, http.StatusBadRequest, "embeddings_unavailable", err.Error())
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
 	defer cancel()
-	vectors, err := c.EmbedBatch(ctx, inputs)
-	if err != nil {
+
+	// EmbedBatch takes as many texts as the context has sequences, so a large
+	// request is embedded in fixed-size batches rather than refused.
+	batch := max(s.embedBatch, 1)
+	vectors := make([][]float32, 0, len(inputs))
+	var batchErr embedErr
+	for start := 0; start < len(inputs); start += batch {
+		end := start + batch
+		if end > len(inputs) {
+			end = len(inputs)
+		}
+		part, perr := c.EmbedBatch(ctx, inputs[start:end])
+		if perr != nil {
+			batchErr = embedErr{perr}
+			break
+		}
+		vectors = append(vectors, part...)
+	}
+	if batchErr.err != nil {
+		err := batchErr.err
 		if errors.Is(err, context.DeadlineExceeded) {
 			writeError(w, http.StatusGatewayTimeout, "timeout", "the request exceeded the "+s.timeout.String()+" deadline")
 			return
@@ -593,7 +621,7 @@ func (s *server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data[i] = embeddingItem{Object: "embedding", Index: i, Embedding: vectors[i]}
-		if ids, err := s.model.Vocab().Tokenize(text, true); err == nil {
+		if ids, err := s.embeddingModel().Vocab().Tokenize(text, true); err == nil {
 			tokens += len(ids)
 		}
 	}
@@ -605,6 +633,15 @@ func (s *server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// embeddingModel reports the model embeddings are read from, which is a dedicated
+// embedding model unless the operator opted into the chat model.
+func (s *server) embeddingModel() *llama.Model {
+	if s.embedModel != nil {
+		return s.embedModel
+	}
+	return s.model
+}
+
 func (s *server) embeddingContext() (*llama.Context, error) {
 	s.embedMu.Lock()
 	defer s.embedMu.Unlock()
@@ -614,12 +651,19 @@ func (s *server) embeddingContext() (*llama.Context, error) {
 	if s.embedErr != nil {
 		return nil, s.embedErr
 	}
-	if s.model.EmbeddingSize() <= 0 {
-		s.embedErr = errors.New("the model has no embedding output")
+	if s.embedModel == nil && !s.allowChatEmbeddings {
+		s.embedErr = errors.New("this server has no embedding model: restart it with -embed-model <path/to/embed.gguf>, or pass -embed-from-chat-model if the chat model really is an embedding model")
 		return nil, s.embedErr
 	}
-	c, err := s.model.NewContext(llama.ContextOptions{
+	if s.embeddingModel().EmbeddingSize() <= 0 {
+		s.embedErr = errors.New("the embedding model has no embedding output")
+		return nil, s.embedErr
+	}
+	// One sequence per text in a batch: pooling reads a vector per sequence, so
+	// the context has to have room for every text handed to EmbedBatch at once.
+	c, err := s.embeddingModel().NewContext(llama.ContextOptions{
 		ContextSize: s.embedCtxSize,
+		Sequences:   uint32(max(s.embedBatch, 1)),
 		Embeddings:  true,
 		Pooling:     s.embedPool,
 	})

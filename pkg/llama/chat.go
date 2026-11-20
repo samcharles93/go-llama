@@ -16,11 +16,14 @@ type ChatMessage struct {
 	Content string
 }
 
-// SystemMessage, UserMessage and AssistantMessage build the common cases.
+// SystemMessage builds a system turn.
 func SystemMessage(content string) ChatMessage { return ChatMessage{Role: "system", Content: content} }
 
+// UserMessage builds a user turn.
 func UserMessage(content string) ChatMessage { return ChatMessage{Role: "user", Content: content} }
 
+// AssistantMessage builds an assistant turn, which is what you append after a
+// reply so the next turn sees it.
 func AssistantMessage(content string) ChatMessage {
 	return ChatMessage{Role: "assistant", Content: content}
 }

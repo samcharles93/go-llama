@@ -230,3 +230,44 @@ git add README.md docs/
 
 `make build` and `make test` call `go` without that variable, so export it in the
 shell instead: `export GOFLAGS=-buildvcs=false`.
+
+## A grammar-constrained generation kills the process
+
+Symptom: the process dies with `terminate called after throwing an instance of
+'std::runtime_error'` and `what(): Unexpected empty grammar stack after accepting
+piece: ...`, printed from `ggml_uncaught_exception`. Exit code 134.
+
+Cause: llama.cpp's grammar sampler throws a C++ exception when a token is accepted
+after the grammar has already completed, and an exception crossing the cgo
+boundary aborts the process. Two things trigger it: accepting the
+end-of-generation token after the grammar finished, and a grammar no token of the
+model's vocabulary can satisfy.
+
+Fix: this package accepts stop tokens before feeding them to the sampler, so the
+first case does not arise here. For the second, write grammars in terms of the
+model's own surface forms. Most tokenizers cannot produce a bare `"yes"` mid
+sentence because the token is `" yes"`, so allow the space:
+
+```
+root ::= " yes" | " no"        # matches the tokenizer
+root ::= "yes" | "no"          # may match nothing, which aborts the process
+```
+
+`CompletionOptions.Grammar` returns `ErrGrammar` for a grammar llama.cpp rejects at
+parse time; it cannot report the runtime case, because that is where llama.cpp
+throws instead of returning an error.
+
+## Repetition penalties feel far too strong, or generations loop
+
+Symptom: with `RepeatPenalty` around 1.1 the model avoids words it used a moment
+ago far more aggressively than the same settings do in llama.cpp's own tools.
+
+Cause: `llama_sampler_sample` in this llama.cpp applies the chain, picks a token
+and accepts it in one call. A caller that then calls `llama_sampler_accept` accepts
+every token twice, so the repetition window fills twice as fast and penalties are
+applied to it twice.
+
+Fix: this package applies the chain with `llama_sampler_apply` and leaves accepting
+to the caller (`Sampler.Sample` plus `Sampler.Accept`). Do not switch back to
+`llama_sampler_sample` without dropping the explicit accept.
+

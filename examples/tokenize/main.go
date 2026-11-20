@@ -63,7 +63,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer model.Close()
+	defer func() { _ = model.Close() }()
 
 	if *chat {
 		messages := []llama.ChatMessage{llama.UserMessage(text)}

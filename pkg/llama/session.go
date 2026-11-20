@@ -4,6 +4,7 @@ package llama
 #include "llama.h"
 */
 import "C"
+
 import (
 	"bytes"
 	"encoding/binary"

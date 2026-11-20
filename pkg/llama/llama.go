@@ -15,6 +15,7 @@ static void install_log_bridge(void) {
 }
 */
 import "C"
+
 import (
 	"os"
 	"sync"

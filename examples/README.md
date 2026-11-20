@@ -92,21 +92,26 @@ Routes: `POST /v1/chat/completions`, `POST /v1/completions`,
 Flags: `-model` (required), `-addr`, `-ctx`, `-timeout`, `-parallel`, `-ngl`,
 `-api-key` (require `Authorization: Bearer <key>` on `/v1` routes), `-max-queue`
 (waiters allowed before 429; 0 waits forever), `-max-body`, `-drain`,
-`-embed-ctx`, `-embed-pool`.
+`-embed-model` (a GGUF embedding model; enables `/v1/embeddings`),
+`-embed-from-chat-model` (opt in to embedding with the chat model),
+`-embed-ctx`, `-embed-batch` (texts per embedding batch), `-embed-pool`.
 
-Embeddings run on a context of their own, never on the pooled chat contexts,
-because a context created with `Embeddings` enabled clears its KV cache on every
-call. Point `-model` at an embedding model for useful vectors:
+Embeddings run on a model and context of their own, never on the pooled chat
+contexts, because a context created with `Embeddings` enabled clears its KV cache
+on every call. Pooling a chat model's hidden states yields vectors that are
+numerically fine and semantically useless, so `/v1/embeddings` is opt-in:
 
 ```
-go run ./examples/server -model $EMBED_MODEL -addr 127.0.0.1:8080
+go run ./examples/server -model $CHAT_MODEL -embed-model $EMBED_MODEL
 curl -s localhost:8080/v1/embeddings -d '{"input":["a cat","a kitten"]}'
 ```
 
-The endpoint answers 400 with the reason when the model cannot produce
-embeddings. `-embed-pool` must match the model (mean for encoder models such as
-embeddinggemma, cls for BERT-style ones); the pooling mode cannot be read back
-from the model through this package, so it is a flag.
+Without `-embed-model` (or the explicit `-embed-from-chat-model`) the endpoint
+answers 400 explaining what to pass. `-embed-pool` must match the model (mean for
+encoder models such as embeddinggemma, cls for BERT-style ones); the pooling mode
+cannot be read back from the model through this package, so it is a flag.
+`-embed-batch` is both the number of texts embedded per batch and the sequence
+count of the embedding context.
 
 ## embed
 

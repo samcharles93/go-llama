@@ -59,13 +59,4 @@ func errorf(kind error, format string, args ...any) error {
 	return &opError{kind: kind, msg: fmt.Sprintf(format, args...)}
 }
 
-// errUnknownEncoding is returned when a backend function reports failure
-// without a usable message.
-func cFail(kind error, what string, code int32) error {
-	if code == 0 {
-		return nil
-	}
-	return errorf(kind, "%s failed with code %d", what, code)
-}
-
 func trimNul(s string) string { return strings.TrimRight(s, "\x00") }

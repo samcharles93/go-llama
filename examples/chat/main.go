@@ -58,7 +58,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer model.Close()
+	defer func() { _ = model.Close() }()
 
 	fmt.Printf("model: %s\n", model.Description())
 	if !*raw && model.ChatTemplate("") == "" {
@@ -70,7 +70,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer ctx.Close()
+	defer func() { _ = ctx.Close() }()
 
 	opts := llama.DefaultCompletionOptions()
 	opts.MaxTokens = *maxTokens

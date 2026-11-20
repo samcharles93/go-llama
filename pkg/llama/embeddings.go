@@ -126,7 +126,7 @@ func (c *Context) embedPooled(ctx context.Context, texts []string, nEmbd int) ([
 	if err != nil {
 		return nil, err
 	}
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	out := make([][]float32, len(texts))
 	for start := 0; start < len(texts); {

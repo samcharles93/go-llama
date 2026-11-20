@@ -4,6 +4,7 @@ package llama
 #include "llama.h"
 */
 import "C"
+
 import (
 	"io"
 	"log/slog"
@@ -13,11 +14,6 @@ import (
 	"unsafe"
 )
 
-// Logger receives llama.cpp's log output. It defaults to a warning-level
-// handler on stderr, because llama.cpp's info output (model metadata, backend
-// selection) is noise for most programs.
-//
-// Set it before loading a model to see that output; see SetLogLevel.
 // Log levels for SetLogLevel, mirroring slog.
 const (
 	LogLevelDebug = slog.LevelDebug
@@ -26,6 +22,10 @@ const (
 	LogLevelError = slog.LevelError
 )
 
+// Logger receives llama.cpp's log output. It defaults to a warning-level handler
+// on stderr, because llama.cpp's info output (model metadata, backend selection)
+// is noise for most programs. Set it before loading a model, or call SetLogLevel;
+// GO_LLAMA_LOG_LEVEL sets the level from the environment.
 var Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: defaultLogLevel()}))
 
 // defaultLogLevel reads GO_LLAMA_LOG_LEVEL so a deployment can turn llama.cpp's

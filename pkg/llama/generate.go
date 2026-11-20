@@ -5,6 +5,7 @@ package llama
 #include <stdlib.h>
 */
 import "C"
+
 import (
 	"context"
 	"errors"
@@ -171,7 +172,7 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 	if err != nil {
 		return res, err
 	}
-	defer sampler.Close()
+	defer func() { _ = sampler.Close() }()
 
 	C.llama_perf_context_reset(c.ptr)
 	reused, err := c.syncKV(tokens)
@@ -401,14 +402,14 @@ func (c *Context) scratchBatch(n int) (*Batch, error) {
 // forever.
 func (c *Context) decode(b *Batch) error {
 	rc := C.llama_decode(c.ptr, b.batch)
-	switch {
-	case rc == 0:
+	switch rc {
+	case 0:
 		return nil
-	case rc == 1:
+	case 1:
 		return errorf(ErrContextFull, "llama_decode found no KV cache slot for %d tokens (context holds %d)", b.Len(), c.nCtx)
-	case rc == 2:
+	case 2:
 		return errorf(ErrDecode, "llama_decode was aborted")
-	case rc == -1:
+	case -1:
 		return errorf(ErrDecode, "llama_decode rejected the batch (invalid token id or position)")
 	default:
 		C.llama_memory_clear(C.llama_get_memory(c.ptr), true)

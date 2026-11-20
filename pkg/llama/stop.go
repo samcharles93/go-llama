@@ -37,9 +37,6 @@ func newStopMatcher(stops []string) *stopMatcher {
 	return m
 }
 
-// active reports whether any stop sequence is configured.
-func (m *stopMatcher) active() bool { return m != nil && len(m.stops) > 0 }
-
 // Push appends a piece of generated text and returns the part that is safe to
 // emit (may be empty). When a stop sequence matches, hit is true and the caller
 // must stop generating; the stop text itself is dropped.
@@ -95,11 +92,11 @@ func (m *stopMatcher) drain(s string) (string, bool) {
 	// next one.
 	hold := 0
 	for _, stop := range m.stops {
-		max := len(stop) - 1
-		if max > len(s) {
-			max = len(s)
+		limit := len(stop) - 1
+		if limit > len(s) {
+			limit = len(s)
 		}
-		for n := max; n > hold; n-- {
+		for n := limit; n > hold; n-- {
 			if strings.HasSuffix(s, stop[:n]) {
 				hold = n
 				break

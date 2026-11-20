@@ -293,6 +293,12 @@ func cosine(a, b []float32) float64 {
 }
 ```
 
+`EmbedBatch` submits every text as its own sequence, so the context needs at least
+that many sequences; a `ContextOptions.Sequences` that is too small returns an
+error naming the limit. Pooled embeddings are computed per micro-batch, so a text
+longer than `ContextOptions.UBatchSize` (512 by default) cannot be embedded in one
+piece: raise `UBatchSize` for long documents.
+
 An embedding context must set `Embeddings: true`; a chat context cannot be reused
 for embeddings. `PoolingMean`, `PoolingCLS` and `PoolingLast` need a model trained
 for pooled output, which is what embedding GGUFs are. With `PoolingNone` (the
@@ -425,6 +431,67 @@ KV cache. The weights are the expensive part and are loaded once: a 1.2B
 `Q4_K_M` file costs about 0.7 GB whatever the number of contexts, and each
 context adds its KV cache on top of that.
 
+### Sessions and long conversations
+
+```go
+func resume(path string) error {
+	model, err := llama.LoadModel(path)
+	if err != nil {
+		return err
+	}
+	defer model.Close()
+
+	c, err := model.NewContext()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if _, err := c.Generate(context.Background(), "Explain mutexes in one sentence.", llama.GreedyCompletionOptions(24)); err != nil {
+		return err
+	}
+
+	// Persist the KV cache plus the token history, then restore it later instead
+	// of paying for the prompt again.
+	state, err := c.SaveState()
+	if err != nil {
+		return err
+	}
+	other, err := model.NewContext()
+	if err != nil {
+		return err
+	}
+	defer other.Close()
+	if err := other.LoadState(state); err != nil {
+		return err
+	}
+
+	// Trim what a conversation no longer needs.
+	if err := other.Truncate(other.TokenCount() / 2); err != nil {
+		return err
+	}
+	fmt.Println(len(other.History()), "tokens still cached")
+
+	// Keep a chat inside the window: FitMessages drops the oldest turns and never
+	// drops the system prompt or the newest message.
+	fitted, err := model.FitMessages([]llama.ChatMessage{
+		llama.SystemMessage("Answer briefly."),
+		llama.UserMessage("A question with a long history behind it."),
+	}, c.ContextSize()-256)
+	if err != nil {
+		return err
+	}
+	fmt.Println(len(fitted), "messages fit")
+	return nil
+}
+```
+
+`Model.CountTokens` reports how many tokens a text occupies, which is what a
+server needs before it decides a conversation no longer fits.
+`Model.Metadata` returns the GGUF key/value pairs (architecture, quantisation,
+trained context), and `Model.IsHybrid` / `IsRecurrent` report whether the model can
+trim its own state at all.
+
 ## KV cache reuse
 
 A context keeps the tokens currently in its KV cache and, on each call, compares
@@ -505,13 +572,19 @@ so the module directive is the constraint.
 
 ## Known limits
 
-- No LoRA adapters. llama.cpp can apply them; this package has no entry point.
+- LoRA adapters are applied to a context rather than a model (`Model.LoadLora`,
+  `LoraAdapter.Apply`), so a server can serve one base model with a different
+  adapter per request. Adapters are freed with the model, not individually.
 - No multimodal input. The `mtmd` library is built but not bound, so image and
   audio models load as text-only at best.
 - No function calling. Chat templates render, but tool schemas, tool calls and
   tool results are not parsed or validated.
 - Grammars are supported through `CompletionOptions.Grammar` and parsed on every
-  generation, not cached between calls.
+  generation, not cached between calls. The grammar must be satisfiable by the
+  model's own vocabulary: if no token can continue the grammar, llama.cpp throws
+  a C++ exception that aborts the process rather than returning an error, so
+  write grammars that allow the tokenizer's surface forms (an optional leading
+  space is the usual fix).
 - One sequence per context by default. `ContextOptions.Sequences` raises that for
   hand-built batches through `Context.Decode`, but `Generate` and `Stream` use
   sequence 0.
@@ -532,6 +605,7 @@ so the module directive is the constraint.
 | `JOBS` | Parallel build jobs, defaulting to `nproc`. |
 | `CGO_CFLAGS`, `CGO_LDFLAGS` | Override the include paths and link flags in `pkg/llama/cgo.go`, for an installed llama.cpp instead of the submodule. |
 | `TEST_MODEL`, `EMBED_MODEL` | GGUF files for `make test-integration` and `make bench`. Both default to `models/*.gguf`. |
+| `GO_LLAMA_LOG_LEVEL` | `debug`, `info`, `warn` (default) or `error` for llama.cpp's own logging. `llama.SetLogLevel` overrides it at runtime. |
 
 The targets that matter here:
 

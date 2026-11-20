@@ -50,7 +50,10 @@ func run() error {
 	maxQueue := flag.Int("max-queue", 0, "requests that may wait for a context (0 waits forever)")
 	maxBody := flag.Int64("max-body", 1<<20, "largest accepted request body in bytes")
 	drain := flag.Duration("drain", 15*time.Second, "how long shutdown waits for in-flight requests")
+	embedModelPath := flag.String("embed-model", "", "path to a GGUF embedding model (enables /v1/embeddings)")
+	allowChatEmbeddings := flag.Bool("embed-from-chat-model", false, "allow /v1/embeddings to use the chat model (only meaningful for decoder embedding models)")
 	embedCtx := flag.Uint("embed-ctx", 2048, "context size for the embeddings context")
+	embedBatch := flag.Int("embed-batch", 8, "texts embedded in one batch, also the embeddings context sequence count")
 	embedPool := flag.String("embed-pool", "mean", "pooling for embeddings: mean, cls, last or none")
 	flag.Parse()
 
@@ -62,6 +65,9 @@ func run() error {
 	}
 	if *maxQueue < 0 || *maxBody < 0 {
 		return errors.New("-max-queue and -max-body must not be negative")
+	}
+	if *embedBatch < 1 {
+		return fmt.Errorf("-embed-batch must be at least 1, got %d", *embedBatch)
 	}
 	pooling, err := parsePooling(*embedPool)
 	if err != nil {
@@ -79,20 +85,37 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer model.Close()
+	defer func() { _ = model.Close() }()
+
+	// Embeddings usually need a different model: pooling a chat model's hidden
+	// states produces vectors that are numerically fine and semantically useless,
+	// so this is opt-in rather than a silent fallback.
+	var embedModel *llama.Model
+	if *embedModelPath != "" {
+		embedModel, err = llama.LoadModel(*embedModelPath, llama.ModelParams{
+			GPULayers: int32(*ngl),
+			UseMmap:   true,
+		})
+		if err != nil {
+			return fmt.Errorf("load -embed-model: %w", err)
+		}
+		defer func() { _ = embedModel.Close() }()
+	}
 
 	s := &server{
-		model:        model,
-		id:           modelID(*modelPath),
-		created:      time.Now().Unix(),
-		pool:         make(chan *llama.Context, *parallel),
-		timeout:      *timeout,
-		apiKey:       *apiKey,
-		maxQueue:     *maxQueue,
-		maxBody:      *maxBody,
-		embedPool:    pooling,
-		embedCtxSize: uint32(*embedCtx),
-		log:          newLogger(),
+		model:               model,
+		embedModel:          embedModel,
+		allowChatEmbeddings: *allowChatEmbeddings,
+		id:                  modelID(*modelPath),
+		created:             time.Now().Unix(),
+		pool:                make(chan *llama.Context, *parallel),
+		timeout:             *timeout,
+		apiKey:              *apiKey,
+		maxQueue:            *maxQueue,
+		maxBody:             *maxBody,
+		embedPool:           pooling,
+		embedCtxSize:        uint32(*embedCtx),
+		log:                 newLogger(),
 	}
 
 	// One context per parallel slot, all sharing the model's weights.
@@ -128,10 +151,17 @@ func run() error {
 		errc <- srv.ListenAndServe()
 	}()
 
+	embedSource := "disabled"
+	if embedModel != nil {
+		embedSource = *embedModelPath
+	} else if *allowChatEmbeddings {
+		embedSource = "chat model (opt-in)"
+	}
 	s.log.Info("serving",
 		"addr", *addr,
 		"model", s.id,
 		"description", model.Description(),
+		"embeddings", embedSource,
 		"contexts", *parallel,
 		"context_size", contexts[0].ContextSize(),
 		"timeout", timeout.String(),

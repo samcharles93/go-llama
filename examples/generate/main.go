@@ -49,13 +49,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer model.Close()
+	defer func() { _ = model.Close() }()
 
 	ctx, err := model.NewContext(llama.ContextOptions{ContextSize: uint32(*ctxSize)})
 	if err != nil {
 		return err
 	}
-	defer ctx.Close()
+	defer func() { _ = ctx.Close() }()
 
 	opts := llama.DefaultCompletionOptions()
 	opts.MaxTokens = *maxTokens

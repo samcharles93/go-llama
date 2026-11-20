@@ -66,7 +66,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer model.Close()
+	defer func() { _ = model.Close() }()
 
 	// The pooling mode has to be named: llama.cpp leaves the output buffer empty
 	// when the context asks for "unspecified" pooling, and this package returns
@@ -80,7 +80,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create embedding context (is %s an embedding model?): %w", *modelPath, err)
 	}
-	defer ctx.Close()
+	defer func() { _ = ctx.Close() }()
 
 	vectors, err := ctx.EmbedBatch(context.Background(), texts)
 	if err != nil {

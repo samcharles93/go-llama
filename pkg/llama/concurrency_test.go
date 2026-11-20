@@ -263,28 +263,3 @@ func l2norm(v []float32) float64 {
 	}
 	return math.Sqrt(sum)
 }
-
-func cosine(a, b []float32) float64 {
-	var dot, na, nb float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
-	}
-	if na == 0 || nb == 0 {
-		return 0
-	}
-	return dot / math.Sqrt(na*nb)
-}
-
-func equalVectors(a, b []float32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
