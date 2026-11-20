@@ -1,0 +1,42 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - misspell
+  exclusions:
+    generated: lax
+    paths:
+      # The llama.cpp submodule is C++ plus its CMake output. Nothing here is Go
+      # code this project owns, and walking it only slows the run down.
+      - llama.cpp
+    rules:
+      # cgo glue stores C pointers in Go structs and passes the address of a Go
+      # buffer to C for the length of one call. govet's unsafeptr analysis cannot
+      # see through that boundary and reports a false positive per conversion.
+      - path: pkg/llama/
+        linters:
+          - govet
+        text: possible misuse of unsafe.Pointer
+      # A test that cannot close a batch has already failed on the assertion it
+      # cared about; the cleanup error adds nothing.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofumpt
+  settings:
+    gofumpt:
+      module-path: go-llama
