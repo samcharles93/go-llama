@@ -1,103 +1,102 @@
+// Command chat is an interactive terminal chat loop over a single GGUF model.
+//
+//	go run ./examples/chat models/model.gguf
+//
+// Type a message and press enter. Ctrl-C interrupts the reply, Ctrl-D or "exit"
+// leaves.
 package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
+	"flag"
 	"fmt"
-	"go-llama/pkg/llama"
 	"os"
+	"os/signal"
 	"strings"
+
+	"go-llama/pkg/llama"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <model_path>")
-		return
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	system := flag.String("system", "You are a helpful assistant.", "system prompt")
+	maxTokens := flag.Int("max-tokens", 512, "maximum tokens per reply")
+	temp := flag.Float64("temp", 0.7, "sampling temperature")
+	ctxSize := flag.Uint("ctx", 0, "context size in tokens (0 = model default)")
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		return errors.New("usage: chat [flags] <model.gguf>")
 	}
 
-	modelPath := os.Args[1]
+	llama.Init()
+	defer llama.Shutdown()
+	llama.SetLogLevel(llama.LogLevelWarn)
 
-	llama.Initialize()
-	defer llama.Free()
-
-	model, err := llama.LoadModel(modelPath)
+	model, err := llama.LoadModel(flag.Arg(0))
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
+		return err
 	}
-	defer model.Free()
+	defer model.Close()
+	fmt.Printf("model: %s\n", model.Description())
 
-	ctx, err := model.NewContext()
+	ctx, err := model.NewContext(llama.ContextOptions{ContextSize: uint32(*ctxSize)})
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
+		return err
 	}
-	defer ctx.Free()
+	defer ctx.Close()
 
-	sampler := llama.NewSamplerChain()
-	defer sampler.Free()
-	sampler.AddTemp(0.8)
-	sampler.AddTopK(40)
-	sampler.AddTopP(0.9, 1)
-	sampler.AddDist(1234)
+	messages := []llama.ChatMessage{llama.SystemMessage(*system)}
+	opts := llama.DefaultCompletionOptions()
+	opts.MaxTokens = *maxTokens
+	opts.Temperature = float32(*temp)
 
-
-batch := llama.NewBatch(512, 0, 1)
-	defer batch.Free()
-
+	interrupt, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	reader := bufio.NewReader(os.Stdin)
-	curPos := int32(0)
-
-	fmt.Println("Chat started. Type 'exit' to quit.")
 
 	for {
-		fmt.Print("\nUser > ")
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "exit" {
-			break
+		fmt.Print("\n> ")
+		line, readErr := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if readErr != nil && line == "" {
+			fmt.Println()
+			return nil
 		}
-
-		// In a real chat model, we'd apply a template here.
-		// For this low-level example, we just feed the raw text.
-		tokens := model.Tokenize(input, curPos == 0, true)
-
-		// Process input tokens
-		batch.Clear()
-		for i, t := range tokens {
-			batch.Add(t, curPos+int32(i), []int32{0}, i == len(tokens)-1)
+		if line == "" {
+			continue
 		}
-		curPos += int32(len(tokens))
-
-		if err := ctx.Decode(batch); err != nil {
-			fmt.Printf("\nDecode error: %v\n", err)
-			break
+		if strings.EqualFold(line, "exit") || strings.EqualFold(line, "quit") {
+			return nil
 		}
+		messages = append(messages, llama.UserMessage(line))
 
-		fmt.Print("AI > ")
-
-		// Generate response tokens
-		for i := 0; i < 500; i++ {
-			newToken := sampler.Sample(ctx, -1)
-			sampler.Accept(newToken)
-
-			piece := model.TokenToPiece(newToken)
-			fmt.Print(piece)
-
-			// Simple EOS check (7 is <|im_end|> for LFM, 2 is <|endoftext|>) 
-			if newToken == 7 || newToken == 2 {
-				break
-			}
-
-			batch.Clear()
-			batch.Add(newToken, curPos, []int32{0}, true)
-			curPos++
-
-			if err := ctx.Decode(batch); err != nil {
-				fmt.Printf("\nDecode error: %v\n", err)
-				break
-			}
+		fmt.Print("\n")
+		var reply strings.Builder
+		res, err := ctx.Chat(interrupt, messages, opts)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
 		}
-		fmt.Println()
+		if res.Text != "" {
+			reply.WriteString(res.Text)
+			fmt.Print(res.Text)
+		}
+		fmt.Printf("\n[%s, %d tokens, %.1f tok/s]", res.StopReason, len(res.Tokens), res.Metrics.TokensPerSecond())
+		if errors.Is(err, context.Canceled) {
+			// The interrupted reply stays in the history so the model can pick
+			// up from it.
+			fmt.Print(" (interrupted)")
+			interrupt, stop = signal.NotifyContext(context.Background(), os.Interrupt)
+			defer stop()
+		}
+		messages = append(messages, llama.AssistantMessage(reply.String()))
 	}
 }

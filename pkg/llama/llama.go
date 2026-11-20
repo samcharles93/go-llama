@@ -1,329 +1,318 @@
 package llama
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../llama.cpp/include -I${SRCDIR}/../../llama.cpp/ggml/include
-#cgo LDFLAGS: -L${SRCDIR}/../../llama.cpp/build/src -L${SRCDIR}/../../llama.cpp/build/ggml/src -lllama -lggml -lggml-base -lggml-cpu -lstdc++ -lm -fopenmp
 #include "llama.h"
 #include <stdlib.h>
-#include <stdio.h>
 
-// Declare the exported Go function
-extern void GoLogCallback(int level, char * text);
+extern void goLogBridge(int level, char * text, void * user_data);
 
-// C callback that forwards to Go
-void c_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
-    GoLogCallback((int)level, (char *)text);
+static void c_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    goLogBridge((int) level, (char *) text, user_data);
 }
 
-// Function to enable logging via Go callback
-void enable_go_logging() {
+static void install_log_bridge(void) {
     llama_log_set(c_log_callback, NULL);
 }
 */
 import "C"
 import (
-	"fmt"
-	"strings"
+	"os"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
-// Initialize the llama backend.
-func Initialize() {
-    // Redirect internal logs to Go slog
-    C.enable_go_logging()
-    
-	C.llama_backend_init()
+// The llama.cpp backend is process-global: llama_backend_init and
+// llama_backend_free must bracket every model, and calling either twice
+// corrupts state. Init is therefore idempotent, and Shutdown only frees the
+// backend once every model and context is closed.
+var (
+	backendOnce sync.Once
+	backendUp   atomic.Bool
+	openModels  atomic.Int64
+)
+
+// Init prepares the llama.cpp backend and routes its logging into this
+// package's logger. It is safe to call from several goroutines and from
+// several places; only the first call does work.
+//
+// Models can be loaded without calling Init: LoadModel calls it for you.
+func Init() {
+	backendOnce.Do(func() {
+		installLogBridgeOnce.Do(func() { C.install_log_bridge() })
+		C.llama_backend_init()
+		backendUp.Store(true)
+	})
 }
 
-// Free the llama backend.
-func Free() {
+var installLogBridgeOnce sync.Once
+
+// Shutdown releases the backend's global resources. It is a no-op while any
+// Model or Context is still open, so closing a leaking context cannot leave a
+// live pointer into freed global state.
+//
+// Most programs never need to call it; the process exit does the same work.
+func Shutdown() {
+	if !backendUp.Load() || openModels.Load() > 0 {
+		return
+	}
+	backendOnce = sync.Once{}
+	backendUp.Store(false)
 	C.llama_backend_free()
 }
 
+// Initialize is Init under the older name.
+//
+// Deprecated: use Init.
+func Initialize() { Init() }
+
+// Free is Shutdown under the older name.
+//
+// Deprecated: use Shutdown.
+func Free() { Shutdown() }
+
+// Model is a loaded GGUF file: weights plus vocabulary. It is safe for
+// concurrent use by several contexts, which is how a server serves parallel
+// requests from one copy of the weights.
 type Model struct {
-	model *C.struct_llama_model
+	ptr    *C.struct_llama_model
+	vocab  *Vocab
+	path   string
+	params ModelParams
+
+	nCtxTrain  int
+	nEmbdOut   int
+	nParams    uint64
+	desc       string
+	closed     atomic.Bool
+	closeOnce  sync.Once
+	contextCnt atomic.Int64
 }
 
-func (m *Model) Free() {
-	C.llama_model_free(m.model)
-}
-
-func (m *Model) BOS() Token {
-	vocab := C.llama_model_get_vocab(m.model)
-	return Token(C.llama_vocab_bos(vocab))
-}
-
-func (m *Model) EOS() Token {
-	vocab := C.llama_model_get_vocab(m.model)
-	return Token(C.llama_vocab_eos(vocab))
-}
-
-type Context struct {
-	ctx   *C.struct_llama_context
-	model *Model
-}
-
-func (c *Context) Free() {
-	C.llama_free(c.ctx)
-}
-
-func (c *Context) Generate(prompt string, opts CompletionOptions) (string, error) {
-	ch, err := c.Stream(prompt, opts)
-	if err != nil {
-		return "", err
+// LoadModel loads a GGUF file. Callers usually pass no params, which loads every
+// layer onto the GPU when one is available (see DefaultModelParams).
+func LoadModel(path string, params ...ModelParams) (*Model, error) {
+	p := DefaultModelParams()
+	if len(params) > 1 {
+		return nil, errorf(ErrModelLoad, "expected at most one ModelParams, got %d", len(params))
+	}
+	if len(params) == 1 {
+		p = params[0]
+	}
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, wrap(ErrModelLoad, "stat "+path, err)
 	}
 
-	var sb strings.Builder
-	for piece := range ch {
-		sb.WriteString(piece)
-	}
-	return sb.String(), nil
-}
+	Init()
 
-func (c *Context) Stream(prompt string, opts CompletionOptions) (<-chan string, error) {
-	out := make(chan string)
+	cParams := C.llama_model_default_params()
+	cParams.n_gpu_layers = C.int32_t(p.GPULayers)
+	cParams.main_gpu = C.int32_t(p.MainGPU)
+	cParams.use_mmap = C.bool(p.UseMmap)
+	cParams.use_mlock = C.bool(p.UseMlock)
+	cParams.vocab_only = C.bool(p.VocabOnly)
 
-	go func() {
-		defer close(out)
-
-		tokens := c.model.Tokenize(prompt, true, true)
-		if len(tokens) == 0 {
-			return
-		}
-
-		batch := NewBatch(int32(len(tokens)+opts.MaxTokens), 0, 1)
-		defer batch.Free()
-
-		sampler := NewSamplerChain()
-		defer sampler.Free()
-		if opts.Temperature > 0 {
-			sampler.AddTemp(opts.Temperature)
-		}
-		if opts.TopK > 0 {
-			sampler.AddTopK(opts.TopK)
-		}
-		if opts.TopP > 0 {
-			sampler.AddTopP(opts.TopP, 1)
-		}
-		sampler.AddDist(opts.Seed)
-
-		// Initial prompt decode
-		for i, t := range tokens {
-			batch.Add(t, int32(i), []int32{0}, i == len(tokens)-1)
-		}
-
-		if err := c.Decode(batch); err != nil {
-			return
-		}
-
-		curPos := int32(len(tokens))
-		eos := c.model.EOS()
-
-		for i := 0; i < opts.MaxTokens; i++ {
-			newToken := sampler.Sample(c, -1)
-			sampler.Accept(newToken)
-
-			if newToken == eos {
-				break
-			}
-
-			piece := c.model.TokenToPiece(newToken)
-			out <- piece
-
-			batch.Clear()
-			batch.Add(newToken, curPos, []int32{0}, true)
-			curPos++
-
-			if err := c.Decode(batch); err != nil {
-				break
-			}
-		}
-	}()
-
-	return out, nil
-}
-
-func LoadModel(path string) (*Model, error) {
-	params := C.llama_model_default_params()
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	m := C.llama_model_load_from_file(cPath, params)
-	if m == nil {
-		return nil, fmt.Errorf("failed to load model from %s", path)
+	ptr := C.llama_model_load_from_file(cPath, cParams)
+	if ptr == nil {
+		return nil, errorf(ErrModelLoad, "%s: llama.cpp could not load the file (wrong format, corrupt, or unsupported architecture)", path)
 	}
 
-	return &Model{model: m}, nil
-}
-
-type ContextParams struct {
-	params C.struct_llama_context_params
-}
-
-func DefaultContextParams() ContextParams {
-	return ContextParams{params: C.llama_context_default_params()}
-}
-
-func (p *ContextParams) SetPooling(poolingType int) {
-	p.params.pooling_type = C.enum_llama_pooling_type(poolingType)
-}
-
-func (m *Model) NewContextWithParams(params ContextParams) (*Context, error) {
-	c := C.llama_init_from_model(m.model, params.params)
-	if c == nil {
-		return nil, fmt.Errorf("failed to create context")
+	m := &Model{
+		ptr:       ptr,
+		vocab:     newVocab(ptr),
+		path:      path,
+		params:    p,
+		nCtxTrain: int(C.llama_model_n_ctx_train(ptr)),
+		nEmbdOut:  int(C.llama_model_n_embd_out(ptr)),
+		nParams:   uint64(C.llama_model_n_params(ptr)),
 	}
-	return &Context{ctx: c, model: m}, nil
+	descBuf := make([]byte, 256)
+	n := C.llama_model_desc(ptr, (*C.char)(unsafe.Pointer(&descBuf[0])), C.size_t(len(descBuf)))
+	if n > 0 {
+		m.desc = trimNul(string(descBuf[:min(int(n), len(descBuf))]))
+	}
+	openModels.Add(1)
+	return m, nil
 }
 
-func (m *Model) NewContext() (*Context, error) {
-	params := C.llama_context_default_params()
-	c := C.llama_init_from_model(m.model, params)
-	if c == nil {
-		return nil, fmt.Errorf("failed to create context")
+// Vocab returns the tokenizer. It stays valid until the model is closed.
+func (m *Model) Vocab() *Vocab { return m.vocab }
+
+// Path reports the file the model was loaded from.
+func (m *Model) Path() string { return m.path }
+
+// Description reports llama.cpp's one-line summary of the architecture, size
+// and quantisation.
+func (m *Model) Description() string { return m.desc }
+
+// ContextSize reports the context length the model was trained for (n_ctx_train).
+func (m *Model) ContextSize() int { return m.nCtxTrain }
+
+// EmbeddingSize reports the width of the vectors Embed returns.
+func (m *Model) EmbeddingSize() int { return m.nEmbdOut }
+
+// Params reports how many parameters the model has.
+func (m *Model) Params() uint64 { return m.nParams }
+
+// LoadParams reports the parameters the model was loaded with.
+func (m *Model) LoadParams() ModelParams { return m.params }
+
+// NewContext creates a context for this model. Callers usually pass nothing,
+// which gives a chat-ready context sized to the model's trained window.
+func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
+	if m == nil || m.closed.Load() {
+		return nil, ErrClosed
 	}
-	return &Context{ctx: c, model: m}, nil
+	o := DefaultContextOptions()
+	if len(opts) > 1 {
+		return nil, errorf(ErrContextCreate, "expected at most one ContextOptions, got %d", len(opts))
+	}
+	if len(opts) == 1 {
+		o = opts[0]
+	}
+
+	cParams := C.llama_context_default_params()
+	cParams.n_ctx = C.uint32_t(o.resolveContextSize(m.nCtxTrain))
+	if o.BatchSize > 0 {
+		cParams.n_batch = C.uint32_t(o.BatchSize)
+	}
+	if o.Sequences > 0 {
+		cParams.n_seq_max = C.uint32_t(o.Sequences)
+	}
+	if o.Threads > 0 {
+		cParams.n_threads = C.int32_t(o.Threads)
+	}
+	if o.ThreadsBatch > 0 {
+		cParams.n_threads_batch = C.int32_t(o.ThreadsBatch)
+	}
+	cParams.embeddings = C.bool(o.Embeddings)
+	cParams.no_perf = C.bool(o.DisablePerf)
+	if o.Pooling != PoolingUnspecified {
+		cParams.pooling_type = C.enum_llama_pooling_type(o.Pooling)
+	}
+	if o.FlashAttention {
+		cParams.flash_attn_type = C.LLAMA_FLASH_ATTN_TYPE_AUTO
+	}
+
+	ptr := C.llama_init_from_model(m.ptr, cParams)
+	if ptr == nil {
+		return nil, errorf(ErrContextCreate, "llama.cpp could not allocate a %d token context for %s (out of memory?); lower ContextOptions.ContextSize", cParams.n_ctx, m.path)
+	}
+
+	nCtx := int(C.llama_n_ctx(ptr))
+	nBatch := int(C.llama_n_batch(ptr))
+	if nBatch <= 0 || nBatch > nCtx {
+		nBatch = nCtx
+	}
+	c := &Context{
+		ptr:        ptr,
+		model:      m,
+		nCtx:       nCtx,
+		nBatch:     nBatch,
+		embeddings: o.Embeddings,
+		pooling:    o.Pooling,
+	}
+	m.contextCnt.Add(1)
+	return c, nil
 }
 
-func (c *Context) Decode(batch *Batch) error {
-	ret := C.llama_decode(c.ctx, batch.batch)
-	if ret != 0 {
-		return fmt.Errorf("llama_decode failed with code %d", ret)
+// Context holds a KV cache and the compute state for one conversation. It is
+// safe for concurrent use: generation takes an internal lock, because a KV cache
+// can only serve one decode at a time. Parallelism comes from several contexts
+// sharing one Model.
+type Context struct {
+	ptr        *C.struct_llama_context
+	model      *Model
+	nCtx       int
+	nBatch     int
+	embeddings bool
+	pooling    PoolingType
+	batch      *Batch
+
+	mu      sync.Mutex
+	history []Token // tokens already in the KV cache, in order
+	closed  atomic.Bool
+}
+
+// Model returns the model the context belongs to.
+func (c *Context) Model() *Model { return c.model }
+
+// ContextSize reports the KV cache size in tokens.
+func (c *Context) ContextSize() int { return c.nCtx }
+
+// BatchSize reports the largest batch the context accepts.
+func (c *Context) BatchSize() int { return c.nBatch }
+
+// TokenCount reports how many tokens currently occupy the KV cache.
+func (c *Context) TokenCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.history)
+}
+
+// Reset drops the KV cache, forgetting the conversation. Embedding contexts
+// must be reset between unrelated documents.
+func (c *Context) Reset() error {
+	if c == nil || c.closed.Load() {
+		return ErrClosed
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
+	c.history = c.history[:0]
 	return nil
 }
 
-func (c *Context) Embeddings(text string) ([]float32, error) {
-	tokens := c.model.Tokenize(text, true, false)
-	batch := NewBatch(int32(len(tokens)), 0, 1)
-	defer batch.Free()
-
-	for i, t := range tokens {
-		batch.Add(t, int32(i), []int32{0}, i == len(tokens)-1)
+// Close frees the context. Safe to call more than once. The Model must outlive
+// it.
+func (c *Context) Close() error {
+	if c == nil || c.closed.Swap(true) {
+		return nil
 	}
-
-	if err := c.Decode(batch); err != nil {
-		return nil, err
+	// Take the lock so a generation running in another goroutine finishes
+	// against a live context.
+	c.mu.Lock()
+	if c.ptr != nil {
+		C.llama_free(c.ptr)
+		c.ptr = nil
 	}
-
-	nEmbd := int(C.llama_model_n_embd(c.model.model))
-	ptr := C.llama_get_embeddings_ith(c.ctx, C.int32_t(len(tokens)-1))
-	if ptr == nil {
-		// Try sequence embeddings if ith returns null (depends on pooling)
-		ptr = C.llama_get_embeddings_seq(c.ctx, 0)
-	}
-	if ptr == nil {
-		return nil, fmt.Errorf("failed to get embeddings (check if pooling is enabled)")
-	}
-
-	slice := (*[1 << 30]float32)(unsafe.Pointer(ptr))[:nEmbd:nEmbd]
-	res := make([]float32, nEmbd)
-	copy(res, slice)
-	return res, nil
+	c.mu.Unlock()
+	c.model.contextCnt.Add(-1)
+	return nil
 }
 
-type Token int32
+// Free is Close, kept for callers written against the old API.
+//
+// Deprecated: use Close.
+func (c *Context) Free() { _ = c.Close() }
 
-type ChatMessage struct {
-	Role    string
-	Content string
-}
-
-func (m *Model) ApplyTemplate(messages []ChatMessage, addAssistant bool) (string, error) {
-	if len(messages) == 0 {
-		return "", nil
+// Close frees the model. Contexts created from it must be closed first; the
+// model refuses to free while they are open.
+func (m *Model) Close() error {
+	if m == nil || m.closed.Swap(true) {
+		return nil
 	}
-
-	cMessages := make([]C.struct_llama_chat_message, len(messages))
-	// Keep pointers to C strings to prevent GC
-	cStrings := make([]*C.char, len(messages)*2)
-
-	for i, msg := range messages {
-		role := C.CString(msg.Role)
-		content := C.CString(msg.Content)
-		cStrings[i*2] = role
-		cStrings[i*2+1] = content
-		
-		cMessages[i].role = role
-		cMessages[i].content = content
-	}
-
-	defer func() {
-		for _, s := range cStrings {
-			C.free(unsafe.Pointer(s))
+	var err error
+	m.closeOnce.Do(func() {
+		if n := m.contextCnt.Load(); n > 0 {
+			m.closed.Store(false)
+			err = errorf(ErrClosed, "model %s still has %d open context(s)", m.path, n)
+			return
 		}
-	}()
-
-	// First call to get length
-	tmpl := C.CString("") // Use default template (empty string usually works or nil)
-    // Actually passing NULL (nil in Go) is safer for default
-    // But C.CString("") creates an empty string. C.llama_chat_apply_template expects NULL for default.
-    // Let's use nil.
-    defer C.free(unsafe.Pointer(tmpl))
-
-    	// Using nil for tmpl
-        var tmplPtr *C.char = nil
-    
-    	n := C.llama_chat_apply_template(
-    		tmplPtr,
-    		&cMessages[0],
-    		C.size_t(len(messages)),
-    				C.bool(addAssistant),
-    				nil,
-    				0,
-    			)
-    		
-    			if n < 0 {
-    		
-    		return "", fmt.Errorf("failed to calculate template length")
-    	}
-    	buf := make([]C.char, n+1)
-	n = C.llama_chat_apply_template(
-		tmplPtr,
-		&cMessages[0],
-		C.size_t(len(messages)),
-		C.bool(addAssistant),
-		&buf[0],
-		n+1,
-	)
-
-	if n < 0 {
-		return "", fmt.Errorf("failed to apply template")
-	}
-
-	return C.GoStringN(&buf[0], n), nil
+		C.llama_model_free(m.ptr)
+		m.ptr = nil
+		openModels.Add(-1)
+	})
+	return err
 }
 
-func (m *Model) Tokenize(text string, addSpecial bool, parseSpecial bool) []Token {
-	vocab := C.llama_model_get_vocab(m.model)
-	cText := C.CString(text)
-	defer C.free(unsafe.Pointer(cText))
-
-	// Estimate max tokens: usually 1 token per char is safe for rough estimation
-	nMax := C.int32_t(len(text) + 4)
-	tokens := make([]C.llama_token, nMax)
-
-	nTokens := C.llama_tokenize(vocab, cText, C.int32_t(len(text)), &tokens[0], nMax, C.bool(addSpecial), C.bool(parseSpecial))
-	if nTokens < 0 {
-		// Buffer too small, resize
-		tokens = make([]C.llama_token, -nTokens)
-		nTokens = C.llama_tokenize(vocab, cText, C.int32_t(len(text)), &tokens[0], -nTokens, C.bool(addSpecial), C.bool(parseSpecial))
-	}
-
-	res := make([]Token, nTokens)
-	for i := 0; i < int(nTokens); i++ {
-		res[i] = Token(tokens[i])
-	}
-	return res
-}
-
-func (m *Model) TokenToPiece(token Token) string {
-	vocab := C.llama_model_get_vocab(m.model)
-	buf := make([]C.char, 128)
-	n := C.llama_token_to_piece(vocab, C.llama_token(token), &buf[0], C.int32_t(len(buf)), 0, true)
-	if n < 0 {
-		buf = make([]C.char, -n)
-		n = C.llama_token_to_piece(vocab, C.llama_token(token), &buf[0], C.int32_t(len(buf)), 0, true)
-	}
-	return C.GoStringN(&buf[0], n)
-}
+// Free is Close, kept for callers written against the old API.
+//
+// Deprecated: use Close.
+func (m *Model) Free() { _ = m.Close() }

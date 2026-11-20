@@ -7,7 +7,7 @@ import (
 
 func main() {
 	fmt.Println("Initializing llama.cpp backend...")
-	llama.Initialize()
-	defer llama.Free()
+	llama.Init()
+	defer llama.Shutdown()
 	fmt.Println("llama.cpp backend initialized successfully!")
 }

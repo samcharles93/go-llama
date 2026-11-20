@@ -1,67 +1,150 @@
 package llama
 
+/*
+#include "llama.h"
+*/
 import "C"
 import (
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
+	"unsafe"
 )
 
-var Logger *slog.Logger
+// Logger receives llama.cpp's log output. It defaults to a warning-level
+// handler on stderr, because llama.cpp's info output (model metadata, backend
+// selection) is noise for most programs.
+//
+// Set it before loading a model to see that output; see SetLogLevel.
+// Log levels for SetLogLevel, mirroring slog.
+const (
+	LogLevelDebug = slog.LevelDebug
+	LogLevelInfo  = slog.LevelInfo
+	LogLevelWarn  = slog.LevelWarn
+	LogLevelError = slog.LevelError
+)
 
-func init() {
-	SetupLogger()
-}
+var Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-func SetupLogger() {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = ".go-llama"
-	} else {
-		configDir = filepath.Join(configDir, ".go-llama")
-	}
-	_ = os.MkdirAll(configDir, 0755)
-	logPath := filepath.Join(configDir, "app.log")
+var (
+	logMu      sync.Mutex
+	pending    strings.Builder
+	pendingLvl int
+	havePend   bool
+)
 
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	var w io.Writer = os.Stderr
-	if err == nil {
-		w = io.MultiWriter(os.Stderr, f)
-	}
-
-	opts := &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}
-	Logger = slog.New(slog.NewTextHandler(w, opts))
-	slog.SetDefault(Logger)
-}
-
-//export GoLogCallback
-func GoLogCallback(level int, text *C.char) {
-	if Logger == nil {
+// SetLogger replaces the logger llama.cpp writes to. Passing nil silences it.
+func SetLogger(l *slog.Logger) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if l == nil {
+		Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 		return
 	}
+	Logger = l
+}
 
+// SetLogLevel sets the minimum severity the default logger reports. Use
+// slog.LevelDebug to see everything llama.cpp emits, including per-tensor
+// backend placement.
+func SetLogLevel(level slog.Level) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
+
+// goLogBridge receives llama.cpp's log callback. It runs on whichever thread is
+// inside llama.cpp, which is not necessarily a Go thread, so everything it
+// touches must be locked.
+//
+// llama.cpp emits text, not lines: one logical message often arrives as several
+// calls, with every call but the last tagged GGML_LOG_LEVEL_CONT. The
+// previous implementation logged each fragment as its own entry, which split
+// sentences across records, and inverted the level mapping so errors were logged
+// at debug.
+//
+//export goLogBridge
+func goLogBridge(level C.int, text *C.char, _ unsafe.Pointer) {
+	if text == nil {
+		return
+	}
 	msg := C.GoString(text)
-	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return
 	}
 
-	// Map llama.cpp levels
-	// 1=Error, 2=Warn, 3=Info, 4=Debug usually.
-	switch level {
-	case 1: // GGML_LOG_LEVEL_ERROR
-		Logger.Error(msg, "source", "llama.cpp")
-	case 2: // GGML_LOG_LEVEL_WARN
-		Logger.Warn(msg, "source", "llama.cpp")
-	case 3: // GGML_LOG_LEVEL_INFO
-		Logger.Info(msg, "source", "llama.cpp")
-	case 4: // GGML_LOG_LEVEL_DEBUG
-		Logger.Debug(msg, "source", "llama.cpp")
-	default:
-		Logger.Info(msg, "source", "llama.cpp", "level", level)
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	const (
+		levelNone  = 0
+		levelDebug = 1
+		levelInfo  = 2
+		levelWarn  = 3
+		levelError = 4
+		levelCont  = 5
+	)
+
+	lvl := int(level)
+	if lvl != levelCont {
+		flushPendingLocked()
+		pendingLvl = lvl
 	}
+	pending.WriteString(msg)
+	if lvl != levelCont && !strings.HasSuffix(msg, "\n") {
+		// The fragment is incomplete: wait for its continuation.
+		havePend = true
+		return
+	}
+	flushPendingLocked()
+}
+
+// flushPendingLocked writes the assembled message to the logger. Callers hold
+// logMu.
+func flushPendingLocked() {
+	if !havePend && pending.Len() == 0 {
+		return
+	}
+	msg := pending.String()
+	pending.Reset()
+	havePend = false
+	emitLog(pendingLvl, msg)
+}
+
+// emitLog writes one assembled message. Callers hold logMu.
+func emitLog(level int, raw string) {
+	body := strings.TrimRight(raw, "\n")
+	if body == "" {
+		return
+	}
+	// This package caps the KV cache at MaxDefaultContextSize by design, so
+	// llama.cpp's "n_ctx_train not fully utilized" notice fires on almost every
+	// context. Report it once per call at debug rather than warning about a
+	// decision the caller made.
+	if strings.Contains(body, "n_ctx_train") && strings.Contains(body, "not be utilized") {
+		level = 1
+	}
+	attrs := []any{"source", "llama.cpp"}
+	switch level {
+	case 1: // GGML_LOG_LEVEL_DEBUG
+		Logger.Debug(body, attrs...)
+	case 2: // GGML_LOG_LEVEL_INFO
+		Logger.Info(body, attrs...)
+	case 3: // GGML_LOG_LEVEL_WARN
+		Logger.Warn(body, attrs...)
+	case 4: // GGML_LOG_LEVEL_ERROR
+		Logger.Error(body, attrs...)
+	default: // GGML_LOG_LEVEL_NONE and anything unexpected
+		Logger.Info(body, attrs...)
+	}
+}
+
+// FlushLogs writes any partially assembled llama.cpp message. Call it before
+// exiting when the last log line matters.
+func FlushLogs() {
+	logMu.Lock()
+	defer logMu.Unlock()
+	flushPendingLocked()
 }
