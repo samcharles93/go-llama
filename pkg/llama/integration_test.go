@@ -596,3 +596,30 @@ func TestGPUOffload(t *testing.T) {
 	}
 	t.Logf("%s offloaded (%s): %d tokens at %.1f tok/s", path, m.Description(), len(res.Tokens), res.Metrics.TokensPerSecond())
 }
+
+// cosine and equalVectors are only used by the integration tests, so they live
+// here rather than in an untagged file where the linter would call them unused.
+func cosine(a, b []float32) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / math.Sqrt(na*nb)
+}
+
+func equalVectors(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
