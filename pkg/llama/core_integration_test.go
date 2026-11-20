@@ -229,3 +229,75 @@ func TestModelCloseRefusesLiveContexts(t *testing.T) {
 		t.Fatalf("NewContext after Close = %v, want ErrClosed", err)
 	}
 }
+
+func TestKVReuseOnExactExtension(t *testing.T) {
+	m := loadCoreModel(t)
+	c := newCoreContext(t, m, ContextOptions{ContextSize: 1024, Threads: 4, ThreadsBatch: 4})
+	ctx := context.Background()
+
+	prompt, err := m.Vocab().Tokenize("The quick brown fox", true)
+	if err != nil {
+		t.Fatalf("Tokenize: %v", err)
+	}
+	if _, err := c.GenerateTokens(ctx, prompt, GreedyCompletionOptions(4)); err != nil {
+		t.Fatalf("first GenerateTokens: %v", err)
+	}
+	history := c.History()
+	if len(history) == 0 {
+		t.Fatal("no history after generation")
+	}
+
+	// Extending the cached tokens exactly is the case every caller gets for free:
+	// nothing in the prefix is evaluated again.
+	extra, err := m.Vocab().Tokenize(" jumps", false)
+	if err != nil {
+		t.Fatalf("Tokenize: %v", err)
+	}
+	next := append(append([]Token{}, history...), extra...)
+
+	res, err := c.GenerateTokens(ctx, next, GreedyCompletionOptions(2))
+	if err != nil {
+		t.Fatalf("second GenerateTokens: %v", err)
+	}
+	if res.PromptTokens != len(next) {
+		t.Fatalf("PromptTokens = %d, want %d", res.PromptTokens, len(next))
+	}
+	if res.ReusedTokens != len(history) {
+		t.Fatalf("ReusedTokens = %d, want %d (the whole cached prefix)", res.ReusedTokens, len(history))
+	}
+}
+
+func TestHybridModelFallsBackToFullRecompute(t *testing.T) {
+	m := loadCoreModel(t)
+	if !m.IsHybrid() && !m.IsRecurrent() {
+		t.Skip("model keeps an attention cache, so it can trim its state")
+	}
+	c := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+
+	prompt, err := m.Vocab().Tokenize("The quick brown fox", true)
+	if err != nil {
+		t.Fatalf("Tokenize: %v", err)
+	}
+	if _, err := c.GenerateTokens(context.Background(), prompt, GreedyCompletionOptions(4)); err != nil {
+		t.Fatalf("first GenerateTokens: %v", err)
+	}
+	history := c.History()
+	if len(history) < 3 {
+		t.Fatalf("history too short to truncate: %d", len(history))
+	}
+
+	// A prompt that diverges before the end of the cache cannot reuse anything:
+	// llama.cpp refuses to drop the tail of a recurrent state, so the context has
+	// to re-evaluate the prompt. ReusedTokens reports that honestly instead of
+	// leaving a stale state behind.
+	diverging := append([]Token{}, history[:len(history)-2]...)
+	diverging = append(diverging, history[len(history)-1])
+
+	res, err := c.GenerateTokens(context.Background(), diverging, GreedyCompletionOptions(2))
+	if err != nil {
+		t.Fatalf("diverging GenerateTokens: %v", err)
+	}
+	if res.ReusedTokens != 0 {
+		t.Fatalf("ReusedTokens = %d, want 0 for a model that cannot trim its state", res.ReusedTokens)
+	}
+}

@@ -80,13 +80,40 @@ type Result struct {
 // result together with an error that satisfies errors.Is(err,
 // context.Canceled).
 func (c *Context) Generate(ctx context.Context, prompt string, opts CompletionOptions) (Result, error) {
+	if c == nil || c.closed.Load() || c.model == nil {
+		return Result{}, ErrClosed
+	}
+	tokens, err := c.model.vocab.Tokenize(prompt, opts.AddBOS)
+	if err != nil {
+		return Result{}, err
+	}
+	return c.GenerateTokens(ctx, tokens, opts)
+}
+
+// GenerateTokens is Generate for a prompt that is already tokenized, which is
+// what a caller wants when it manages the token stream itself, for example to
+// continue exactly from Context.History without paying for a re-tokenization
+// that might merge differently.
+func (c *Context) GenerateTokens(ctx context.Context, prompt []Token, opts CompletionOptions) (Result, error) {
 	var sb strings.Builder
-	res, err := c.generate(ctx, prompt, opts, func(piece string) bool {
+	res, err := c.generateTokens(ctx, prompt, opts, func(piece string) bool {
 		sb.WriteString(piece)
 		return true
 	})
 	res.Text = sb.String()
 	return res, err
+}
+
+// StreamTokens is Stream for an already tokenized prompt.
+func (c *Context) StreamTokens(ctx context.Context, prompt []Token, opts CompletionOptions) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		_, err := c.generateTokens(ctx, prompt, opts, func(piece string) bool {
+			return yield(piece, nil)
+		})
+		if err != nil {
+			yield("", err)
+		}
+	}
 }
 
 // Stream returns an iterator over the generated pieces. Break out of the loop to
@@ -101,24 +128,19 @@ func (c *Context) Generate(ctx context.Context, prompt string, opts CompletionOp
 // Pieces are not lines or words: they are token-aligned and can be partial
 // UTF-8-free text, so write them straight out without trimming.
 func (c *Context) Stream(ctx context.Context, prompt string, opts CompletionOptions) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
-		var failed bool
-		_, err := c.generate(ctx, prompt, opts, func(piece string) bool {
-			if !yield(piece, nil) {
-				return false
-			}
-			return true
-		})
-		if err != nil && !failed {
-			failed = true
-			yield("", err)
-		}
+	if c == nil || c.closed.Load() || c.model == nil {
+		return func(yield func(string, error) bool) { yield("", ErrClosed) }
 	}
+	tokens, err := c.model.vocab.Tokenize(prompt, opts.AddBOS)
+	if err != nil {
+		return func(yield func(string, error) bool) { yield("", err) }
+	}
+	return c.StreamTokens(ctx, tokens, opts)
 }
 
-// generate is the single generation engine behind Generate and Stream. emit
-// returns false when the consumer wants to stop.
-func (c *Context) generate(ctx context.Context, prompt string, opts CompletionOptions, emit func(string) bool) (Result, error) {
+// generateTokens is the single generation engine behind Generate, Stream and
+// their token-typed variants. emit returns false when the consumer wants to stop.
+func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts CompletionOptions, emit func(string) bool) (Result, error) {
 	res := Result{}
 	if c == nil || c.closed.Load() || c.ptr == nil || c.model == nil {
 		return res, ErrClosed
@@ -134,10 +156,6 @@ func (c *Context) generate(ctx context.Context, prompt string, opts CompletionOp
 		return res, wrap(ErrDecode, "generate", err)
 	}
 
-	tokens, err := c.model.vocab.Tokenize(prompt, opts.AddBOS)
-	if err != nil {
-		return res, err
-	}
 	res.PromptTokens = len(tokens)
 	if len(tokens) == 0 {
 		return res, errorf(ErrDecode, "prompt produced no tokens")
@@ -256,8 +274,16 @@ func (c *Context) syncKV(tokens []Token) (int, error) {
 	reused := commonPrefix(c.history, tokens)
 
 	if reused < len(c.history) {
+		// Recurrent and hybrid models keep one state per sequence rather than a
+		// cell per position, so llama.cpp refuses to drop their tail. Going
+		// straight to a full clear saves a call that can only fail and keeps the
+		// reported reuse honest.
 		mem := C.llama_get_memory(c.ptr)
-		if !bool(C.llama_memory_seq_rm(mem, 0, C.llama_pos(reused), -1)) {
+		trimmed := false
+		if !c.model.IsRecurrent() && !c.model.IsHybrid() {
+			trimmed = bool(C.llama_memory_seq_rm(mem, 0, C.llama_pos(reused), -1))
+		}
+		if !trimmed {
 			C.llama_memory_clear(mem, true)
 			reused = 0
 		}

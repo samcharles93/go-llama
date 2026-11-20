@@ -184,6 +184,38 @@ func (m *Model) Params() uint64 { return m.nParams }
 // LoadParams reports the parameters the model was loaded with.
 func (m *Model) LoadParams() ModelParams { return m.params }
 
+// HasDecoder reports whether the model can generate text at all. Embedding-only
+// architectures return false.
+func (m *Model) HasDecoder() bool {
+	if m == nil || m.closed.Load() || m.ptr == nil {
+		return false
+	}
+	return bool(C.llama_model_has_decoder(m.ptr))
+}
+
+// IsRecurrent reports whether the model keeps a recurrent state (Mamba, RWKV and
+// relatives) instead of a plain attention cache.
+func (m *Model) IsRecurrent() bool {
+	if m == nil || m.closed.Load() || m.ptr == nil {
+		return false
+	}
+	return bool(C.llama_model_is_recurrent(m.ptr))
+}
+
+// IsHybrid reports whether the model mixes recurrent and attention layers, as
+// LFM2 does.
+//
+// Hybrid and recurrent models cannot drop the tail of their state, so a turn that
+// diverges from the cached prompt has to re-evaluate the whole prompt: expect
+// Result.ReusedTokens to be zero for them unless the new prompt is an exact
+// extension of the cached one.
+func (m *Model) IsHybrid() bool {
+	if m == nil || m.closed.Load() || m.ptr == nil {
+		return false
+	}
+	return bool(C.llama_model_is_hybrid(m.ptr))
+}
+
 // NewContext creates a context for this model. Callers usually pass nothing,
 // which gives a chat-ready context sized to the model's trained window.
 func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
