@@ -15,7 +15,7 @@ import (
 // the KV cache, context state serialisation and the shutdown ordering between
 // Model and Context. They need GO_LLAMA_TEST_MODEL and skip without it.
 
-func testModelPath(t *testing.T) string {
+func coreModelPath(t *testing.T) string {
 	t.Helper()
 	path := os.Getenv("GO_LLAMA_TEST_MODEL")
 	if path == "" {
@@ -26,9 +26,9 @@ func testModelPath(t *testing.T) string {
 
 // loadTestModel loads the shared test model on the CPU, so several tests can run
 // without competing for the GPU.
-func loadTestModel(t *testing.T) *Model {
+func loadCoreModel(t *testing.T) *Model {
 	t.Helper()
-	m, err := LoadModel(testModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
+	m, err := LoadModel(coreModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
 	if err != nil {
 		t.Fatalf("LoadModel: %v", err)
 	}
@@ -40,7 +40,7 @@ func loadTestModel(t *testing.T) *Model {
 	return m
 }
 
-func newTestContext(t *testing.T, m *Model, opts ContextOptions) *Context {
+func newCoreContext(t *testing.T, m *Model, opts ContextOptions) *Context {
 	t.Helper()
 	c, err := m.NewContext(opts)
 	if err != nil {
@@ -55,7 +55,7 @@ func newTestContext(t *testing.T, m *Model, opts ContextOptions) *Context {
 }
 
 func TestCountTokensMatchesTokenize(t *testing.T) {
-	m := loadTestModel(t)
+	m := loadCoreModel(t)
 	const text = "token counting should agree with tokenize"
 	n, err := m.CountTokens(text, true)
 	if err != nil {
@@ -74,8 +74,8 @@ func TestCountTokensMatchesTokenize(t *testing.T) {
 }
 
 func TestContextHistoryAndTruncate(t *testing.T) {
-	m := loadTestModel(t)
-	c := newTestContext(t, m, ContextOptions{ContextSize: 256, Threads: 4, ThreadsBatch: 4})
+	m := loadCoreModel(t)
+	c := newCoreContext(t, m, ContextOptions{ContextSize: 256, Threads: 4, ThreadsBatch: 4})
 
 	res, err := c.Generate(context.Background(), "The quick brown fox", GreedyCompletionOptions(6))
 	if err != nil {
@@ -115,10 +115,10 @@ func TestContextHistoryAndTruncate(t *testing.T) {
 }
 
 func TestSaveStateResumesConversation(t *testing.T) {
-	m := loadTestModel(t)
+	m := loadCoreModel(t)
 	const prompt = "Explain what a mutex is in one sentence."
 
-	first := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	first := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
 	res, err := first.Generate(context.Background(), prompt, GreedyCompletionOptions(12))
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
@@ -133,7 +133,7 @@ func TestSaveStateResumesConversation(t *testing.T) {
 		t.Fatal("SaveState returned no bytes")
 	}
 
-	second := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	second := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
 	if err := second.LoadState(state); err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
@@ -160,14 +160,14 @@ func TestSaveStateResumesConversation(t *testing.T) {
 	if err := first.SaveStateTo(&buf); err != nil {
 		t.Fatalf("SaveStateTo: %v", err)
 	}
-	third := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	third := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
 	if err := third.LoadStateFrom(&buf); err != nil {
 		t.Fatalf("LoadStateFrom: %v", err)
 	}
 }
 
 func TestCloseDuringGenerateStopsPromptly(t *testing.T) {
-	m := loadTestModel(t)
+	m := loadCoreModel(t)
 	c, err := m.NewContext(ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
@@ -208,7 +208,7 @@ func TestCloseDuringGenerateStopsPromptly(t *testing.T) {
 }
 
 func TestModelCloseRefusesLiveContexts(t *testing.T) {
-	m, err := LoadModel(testModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
+	m, err := LoadModel(coreModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
 	if err != nil {
 		t.Fatalf("LoadModel: %v", err)
 	}

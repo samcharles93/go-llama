@@ -28,8 +28,11 @@ import (
 // backend once every model and context is closed.
 var (
 	backendOnce sync.Once
-	backendUp   atomic.Bool
-	openModels  atomic.Int64
+	// backendMu serialises Shutdown against Init, because rearming the Once
+	// while another goroutine calls Init would otherwise race.
+	backendMu  sync.Mutex
+	backendUp  atomic.Bool
+	openModels atomic.Int64
 )
 
 // Init prepares the llama.cpp backend and routes its logging into this
@@ -53,6 +56,8 @@ var installLogBridgeOnce sync.Once
 //
 // Most programs never need to call it; the process exit does the same work.
 func Shutdown() {
+	backendMu.Lock()
+	defer backendMu.Unlock()
 	if !backendUp.Load() || openModels.Load() > 0 {
 		return
 	}
@@ -304,6 +309,12 @@ func (c *Context) Close() error {
 	if c.ptr != nil {
 		C.llama_free(c.ptr)
 		c.ptr = nil
+	}
+	// The scratch batch holds C memory that llama_batch_free owns, so it has to
+	// go with the context.
+	if c.batch != nil {
+		_ = c.batch.Close()
+		c.batch = nil
 	}
 	c.mu.Unlock()
 
