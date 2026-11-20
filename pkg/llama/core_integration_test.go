@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -308,12 +309,13 @@ func TestFitMessagesDropsOldestTurnsAndKeepsSystem(t *testing.T) {
 	system := SystemMessage("Answer in one word.")
 	msgs := []ChatMessage{system}
 	for range 12 {
-		msgs = append(msgs, UserMessage("padding padding padding padding padding padding"))
+		msgs = append(msgs, UserMessage(strings.Repeat("padding words for the context budget ", 6)))
 		msgs = append(msgs, AssistantMessage("ok"))
 	}
 	msgs = append(msgs, UserMessage("last question?"))
 
-	fitted, err := m.FitMessages(msgs, 256)
+	const budget = 128
+	fitted, err := m.FitMessages(msgs, budget)
 	if err != nil {
 		t.Fatalf("FitMessages: %v", err)
 	}
@@ -335,8 +337,8 @@ func TestFitMessagesDropsOldestTurnsAndKeepsSystem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CountTokens: %v", err)
 	}
-	if n > 256 {
-		t.Fatalf("fitted prompt is %d tokens, budget was 256", n)
+	if n > budget {
+		t.Fatalf("fitted prompt is %d tokens, budget was %d", n, budget)
 	}
 
 	if _, err := m.FitMessages(msgs, 4); err == nil {
