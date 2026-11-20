@@ -5,6 +5,7 @@ package llama
 #include <stdlib.h>
 */
 import "C"
+
 import (
 	"sync/atomic"
 	"unsafe"
@@ -29,68 +30,183 @@ func NewSamplerChain() *Sampler {
 
 // newSamplerFromOptions builds the chain that CompletionOptions describes.
 //
-// Order follows llama.cpp's own recommendation: penalties first (they must see
-// the raw distribution), then the truncation stages from most to least
-// aggressive, then temperature, then the token picker. Greedy decoding skips
-// every stochastic stage so Temperature 0 is genuinely deterministic.
-func newSamplerFromOptions(vocab *Vocab, opts CompletionOptions) (*Sampler, error) {
+// Stage order mirrors llama.cpp's own default in common/sampling.cpp: penalties,
+// DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC, temperature, picker. The
+// penalties come first because they have to see the raw distribution, and the
+// picker comes last because it returns a token instead of rewriting the
+// candidate list. Greedy decoding skips every stochastic stage so Temperature 0
+// is genuinely deterministic.
+//
+// Every failure after the chain exists closes it, so a rejected option set never
+// leaves a half-built chain behind.
+func newSamplerFromOptions(vocab *Vocab, opts CompletionOptions) (_ *Sampler, err error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+
 	s := NewSamplerChain()
 	if s.sampler == nil {
 		return nil, errorf(ErrDecode, "out of memory allocating sampler")
 	}
+	defer func() {
+		if err != nil {
+			_ = s.Close()
+		}
+	}()
 
 	if g := opts.Grammar; g != "" {
 		if vocab == nil {
-			s.Close()
 			return nil, errorf(ErrGrammar, "a grammar needs the model vocabulary")
 		}
 		cGrammar := C.CString(g)
 		defer C.free(unsafe.Pointer(cGrammar))
 		cRoot := C.CString("root")
 		defer C.free(unsafe.Pointer(cRoot))
-		gs := C.llama_sampler_init_grammar(vocab.vocab, cGrammar, cRoot)
-		if gs == nil {
-			s.Close()
-			return nil, errorf(ErrGrammar, "llama.cpp rejected the grammar")
+		if err := s.add(C.llama_sampler_init_grammar(vocab.vocab, cGrammar, cRoot), ErrGrammar); err != nil {
+			return nil, err
 		}
-		C.llama_sampler_chain_add(s.sampler, gs)
 	}
 
-	if opts.RepeatPenalty > 0 && opts.RepeatPenalty != 1 ||
-		opts.PresencePenalty != 0 || opts.FrequencyPenalty != 0 {
-		lastN := opts.RepeatLastN
-		if lastN == 0 {
-			lastN = 64
-		}
+	if opts.penaltiesEnabled() {
 		repeat := opts.RepeatPenalty
 		if repeat <= 0 {
 			repeat = 1
 		}
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_penalties(
-			C.int32_t(lastN), C.float(repeat), C.float(opts.FrequencyPenalty), C.float(opts.PresencePenalty),
-		))
+		if err := s.add(C.llama_sampler_init_penalties(
+			C.int32_t(opts.repeatLastN()), C.float(repeat), C.float(opts.FrequencyPenalty), C.float(opts.PresencePenalty),
+		), ErrDecode); err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.dryEnabled() {
+		if err := s.addDry(vocab, opts); err != nil {
+			return nil, err
+		}
 	}
 
 	if opts.greedy() {
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_greedy())
+		if err := s.add(C.llama_sampler_init_greedy(), ErrDecode); err != nil {
+			return nil, err
+		}
 		return s, nil
 	}
 
-	if opts.TopK > 0 {
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_top_k(C.int32_t(opts.TopK)))
+	if opts.TopNSigma > 0 {
+		if err := s.add(C.llama_sampler_init_top_n_sigma(C.float(opts.TopNSigma)), ErrDecode); err != nil {
+			return nil, err
+		}
+	}
+	if k := clampTopK(opts.TopK, vocabSize(vocab)); k > 0 {
+		if err := s.add(C.llama_sampler_init_top_k(C.int32_t(k)), ErrDecode); err != nil {
+			return nil, err
+		}
 	}
 	if opts.TypicalP > 0 && opts.TypicalP < 1 {
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_typical(C.float(opts.TypicalP), 1))
+		if err := s.add(C.llama_sampler_init_typical(C.float(opts.TypicalP), 1), ErrDecode); err != nil {
+			return nil, err
+		}
 	}
 	if opts.TopP > 0 && opts.TopP < 1 {
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_top_p(C.float(opts.TopP), 1))
+		if err := s.add(C.llama_sampler_init_top_p(C.float(opts.TopP), 1), ErrDecode); err != nil {
+			return nil, err
+		}
 	}
 	if opts.MinP > 0 {
-		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_min_p(C.float(opts.MinP), 1))
+		if err := s.add(C.llama_sampler_init_min_p(C.float(opts.MinP), 1), ErrDecode); err != nil {
+			return nil, err
+		}
 	}
-	C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_temp(C.float(opts.Temperature)))
-	C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_dist(C.uint32_t(opts.Seed)))
+	if opts.xtcEnabled() {
+		if err := s.add(C.llama_sampler_init_xtc(C.float(opts.XTCProbability), C.float(opts.XTCThreshold), 1, C.uint32_t(opts.Seed)), ErrDecode); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.add(C.llama_sampler_init_temp(C.float(opts.Temperature)), ErrDecode); err != nil {
+		return nil, err
+	}
+
+	if opts.mirostatEnabled() {
+		// Mirostat picks the token itself, so it replaces the distribution
+		// sampler rather than running alongside it.
+		if err := s.add(C.llama_sampler_init_mirostat_v2(C.uint32_t(opts.Seed), C.float(opts.MirostatTau), C.float(opts.MirostatEta)), ErrDecode); err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+	if err := s.add(C.llama_sampler_init_dist(C.uint32_t(opts.Seed)), ErrDecode); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// add appends a stage llama.cpp just built. The initialisers only return nil
+// when they cannot allocate, and a nil stage in the chain would crash on first
+// use, so the failure is reported instead.
+func (s *Sampler) add(stage *C.struct_llama_sampler, kind error) error {
+	if stage == nil {
+		return errorf(kind, "llama.cpp could not allocate a sampler stage")
+	}
+	C.llama_sampler_chain_add(s.sampler, stage)
+	return nil
+}
+
+// addDry appends the DRY stage. DRY tokenises its sequence breakers against the
+// vocabulary and uses the trained context size to resolve a -1 window, so it
+// cannot be built without a model.
+func (s *Sampler) addDry(vocab *Vocab, opts CompletionOptions) error {
+	if vocab == nil || vocab.vocab == nil {
+		return errorf(ErrDecode, "DRY needs the model vocabulary")
+	}
+
+	breakers := make([]*C.char, len(opts.DrySequenceBreakers))
+	for i, b := range opts.DrySequenceBreakers {
+		breakers[i] = C.CString(b)
+	}
+	defer func() {
+		for _, b := range breakers {
+			C.free(unsafe.Pointer(b))
+		}
+	}()
+
+	nCtxTrain := 0
+	if vocab.model != nil {
+		nCtxTrain = int(C.llama_model_n_ctx_train(vocab.model))
+	}
+
+	var breakerPtr **C.char
+	if len(breakers) > 0 {
+		breakerPtr = (**C.char)(unsafe.Pointer(&breakers[0]))
+	}
+
+	stage := C.llama_sampler_init_dry(
+		vocab.vocab, C.int32_t(nCtxTrain),
+		C.float(opts.DryMultiplier), C.float(opts.dryBase()),
+		C.int32_t(opts.dryAllowedLength()), C.int32_t(opts.repeatLastN()),
+		breakerPtr, C.size_t(len(breakers)),
+	)
+	return s.add(stage, ErrDecode)
+}
+
+// vocabSize reports the vocabulary size, or 0 when there is no model to ask.
+func vocabSize(v *Vocab) int {
+	if v == nil || v.vocab == nil {
+		return 0
+	}
+	return v.Size()
+}
+
+// clampTopK keeps TopK inside the vocabulary. llama.cpp truncates its candidate
+// list to whatever k it is given, so clamping only saves work; a vocabulary size
+// of 0 means the size is unknown and the value is passed through.
+func clampTopK(k int32, vocabSize int) int32 {
+	if k <= 0 || vocabSize <= 0 {
+		return k
+	}
+	if int64(k) > int64(vocabSize) {
+		return int32(vocabSize)
+	}
+	return k
 }
 
 // AddTopK keeps only the k most likely tokens.
@@ -131,6 +247,59 @@ func (s *Sampler) AddTypical(p float32, minKeep int) *Sampler {
 		}
 		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_typical(C.float(p), C.size_t(minKeep)))
 	}
+	return s
+}
+
+// AddTopNSigma keeps tokens within n standard deviations of the best logit.
+// Zero or a negative value leaves the chain alone.
+func (s *Sampler) AddTopNSigma(n float32) *Sampler {
+	if s.sampler != nil && n > 0 {
+		C.llama_sampler_chain_add(s.sampler, C.llama_sampler_init_top_n_sigma(C.float(n)))
+	}
+	return s
+}
+
+// AddXTC drops the most likely tokens with probability p and samples from what
+// is left, which breaks repetitive loops. A threshold above 0.5 disables the
+// stage, matching llama.cpp's own cut-off.
+func (s *Sampler) AddXTC(p, threshold float32, minKeep int, seed uint32) *Sampler {
+	if s.sampler == nil || p <= 0 || p > 1 || threshold > 0.5 {
+		return s
+	}
+	if minKeep < 1 {
+		minKeep = 1
+	}
+	C.llama_sampler_chain_add(s.sampler,
+		C.llama_sampler_init_xtc(C.float(p), C.float(threshold), C.size_t(minKeep), C.uint32_t(seed)))
+	return s
+}
+
+// AddMirostatV2 holds the output at a target surprise level. It picks the token
+// itself, so it must be the last stage in the chain.
+func (s *Sampler) AddMirostatV2(tau, eta float32, seed uint32) *Sampler {
+	if s.sampler == nil || tau <= 0 || eta <= 0 {
+		return s
+	}
+	C.llama_sampler_chain_add(s.sampler,
+		C.llama_sampler_init_mirostat_v2(C.uint32_t(seed), C.float(tau), C.float(eta)))
+	return s
+}
+
+// AddDRY penalises repeats of sequences already in the window. lastN is the
+// window in tokens: 0 uses the default of 64 and -1 the whole context. breakers
+// restart the count, for example "\n". DRY tokenises the breakers, so the stage
+// is skipped when vocab is nil.
+func (s *Sampler) AddDRY(vocab *Vocab, multiplier, base float32, allowedLength, lastN int32, breakers []string) *Sampler {
+	if s.sampler == nil || multiplier == 0 || vocab == nil || vocab.vocab == nil {
+		return s
+	}
+	_ = s.addDry(vocab, CompletionOptions{
+		DryMultiplier:       multiplier,
+		DryBase:             base,
+		DryAllowedLength:    allowedLength,
+		DryPenaltyLastN:     lastN,
+		DrySequenceBreakers: breakers,
+	})
 	return s
 }
 
@@ -190,6 +359,25 @@ func (s *Sampler) Accept(t Token) {
 	if s != nil && s.sampler != nil {
 		C.llama_sampler_accept(s.sampler, C.llama_token(t))
 	}
+}
+
+// Stages reports llama.cpp's name for each stage in the chain, in the order it
+// applies them. It is how a caller, or a test, checks that a chain matches the
+// documented order instead of inferring it from sampled tokens.
+func (s *Sampler) Stages() []string {
+	if s == nil || s.sampler == nil {
+		return nil
+	}
+	n := int(C.llama_sampler_chain_n(s.sampler))
+	stages := make([]string, 0, n)
+	for i := range n {
+		stage := C.llama_sampler_chain_get(s.sampler, C.int32_t(i))
+		if stage == nil {
+			continue
+		}
+		stages = append(stages, C.GoString(C.llama_sampler_name(stage)))
+	}
+	return stages
 }
 
 // Seed reports the seed the chain actually uses, which matters when it was

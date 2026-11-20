@@ -9,22 +9,30 @@ import "strings"
 // separate pieces), so each piece has to be held back until it cannot be the
 // start of a stop sequence. It also refuses to emit a partial UTF-8 rune, since
 // byte-level tokenizers can split a multi-byte character across two tokens.
+//
+// The held-back bytes live in a single pending string rather than a buffer that
+// is copied back and forth, so a piece with nothing to hold costs no
+// allocation. Only one pending suffix is enough: a stop can only ever start in
+// the run of bytes that has not been proven free of stop prefixes.
 type stopMatcher struct {
-	stops  []string
-	maxLen int
-	buf    strings.Builder
+	stops   []string
+	pending string
+	hit     bool
 }
 
 func newStopMatcher(stops []string) *stopMatcher {
 	m := &stopMatcher{}
+	seen := make(map[string]struct{}, len(stops))
 	for _, s := range stops {
 		if s == "" {
 			continue
 		}
-		m.stops = append(m.stops, s)
-		if len(s) > m.maxLen {
-			m.maxLen = len(s)
+		if _, dup := seen[s]; dup {
+			// A duplicate would only make every scan slower.
+			continue
 		}
+		seen[s] = struct{}{}
+		m.stops = append(m.stops, s)
 	}
 	return m
 }
@@ -36,32 +44,41 @@ func (m *stopMatcher) active() bool { return m != nil && len(m.stops) > 0 }
 // emit (may be empty). When a stop sequence matches, hit is true and the caller
 // must stop generating; the stop text itself is dropped.
 func (m *stopMatcher) Push(piece string) (emit string, hit bool) {
-	if m == nil {
+	if m == nil || len(m.stops) == 0 {
 		return piece, false
 	}
-	m.buf.WriteString(piece)
-	return m.drain(false)
+	if m.hit {
+		// A stop already ended the stream; nothing after it is output.
+		return "", true
+	}
+	s := piece
+	if m.pending != "" {
+		s = m.pending + piece
+		m.pending = ""
+	}
+	return m.drain(s)
 }
 
 // Flush returns anything still held back, for use when generation ends without
-// a stop sequence.
+// a stop sequence. Held-back bytes are by definition not the start of a
+// complete stop, so they are always safe to release.
 func (m *stopMatcher) Flush() string {
-	if m == nil {
+	if m == nil || m.hit {
 		return ""
 	}
-	out, _ := m.drain(true)
+	out := m.pending
+	m.pending = ""
 	return out
 }
 
-func (m *stopMatcher) drain(final bool) (string, bool) {
-	s := m.buf.String()
-	m.buf.Reset()
-	if len(m.stops) == 0 {
-		return s, false
-	}
-
+// drain emits the prefix of s that cannot be part of a stop sequence and parks
+// the rest in m.pending. s is either a fresh piece or pending plus a piece, so
+// the caller owns it.
+func (m *stopMatcher) drain(s string) (string, bool) {
 	// Earliest complete stop sequence wins; ties go to the leftmost match,
-	// which is the one the model actually produced first.
+	// which is the one the model actually produced first. This is what makes
+	// overlapping stops behave: with "\n" and "\n\n" configured, the first
+	// newline is the stop, so the second never reaches the caller.
 	cut := -1
 	for _, stop := range m.stops {
 		if i := strings.Index(s, stop); i >= 0 && (cut < 0 || i < cut) {
@@ -69,16 +86,13 @@ func (m *stopMatcher) drain(final bool) (string, bool) {
 		}
 	}
 	if cut >= 0 {
+		m.hit = true
 		return s[:cut], true
 	}
-	if final {
-		return s, false
-	}
 
-	// Hold back any suffix that could still grow into a stop sequence, and any
-	// trailing bytes that do not yet form a complete rune: byte-level
-	// tokenizers can split a multi-byte character across two tokens, and a
-	// half-written rune is not valid output.
+	// Hold back any suffix that could still grow into a stop sequence: a
+	// proper prefix of a stop at the end of the piece may be completed by the
+	// next one.
 	hold := 0
 	for _, stop := range m.stops {
 		max := len(stop) - 1
@@ -92,14 +106,15 @@ func (m *stopMatcher) drain(final bool) (string, bool) {
 			}
 		}
 	}
-	if n := incompleteRuneSuffix(s); n > hold {
-		hold = n
-	}
-	if hold > len(s) {
-		hold = len(s)
-	}
 	emit := s[:len(s)-hold]
-	m.buf.WriteString(s[len(s)-hold:])
+	// Trailing bytes that do not yet form a complete rune are held too:
+	// byte-level tokenizers split multi-byte characters across tokens, and a
+	// half-written rune is not valid output.
+	if n := incompleteRuneSuffix(emit); n > 0 {
+		hold += n
+		emit = s[:len(s)-hold]
+	}
+	m.pending = s[len(emit):]
 	return emit, false
 }
 
