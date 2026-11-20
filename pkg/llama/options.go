@@ -2,6 +2,7 @@ package llama
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 )
 
@@ -139,7 +140,8 @@ type CompletionOptions struct {
 	// stops or the context fills".
 	MaxTokens int
 	// Temperature scales the distribution. 0 selects greedy decoding and
-	// disables TopK, TopP, MinP, TypicalP and the random seed.
+	// disables every stochastic stage: TopK, TopP, MinP, TypicalP, TopNSigma,
+	// XTC, mirostat and the random seed.
 	Temperature float32
 	// TopK keeps the k most likely tokens. 0 disables it.
 	TopK int32
@@ -151,6 +153,17 @@ type CompletionOptions struct {
 	MinP float32
 	// TypicalP applies locally typical sampling. 0 disables it.
 	TypicalP float32
+	// TopNSigma keeps tokens whose logit is within n standard deviations of
+	// the best one. 0 disables it.
+	TopNSigma float32
+	// XTCProbability is the chance that XTC drops the most likely tokens and
+	// picks from the tail, which breaks the repetitive loops greedy decoding
+	// falls into. 0 disables it. XTC draws random numbers, so it needs Seed.
+	XTCProbability float32
+	// XTCThreshold is the probability at or above which a token counts as an
+	// XTC candidate. Above 0.5 the stage is skipped, the same cut-off
+	// llama.cpp applies; 0 makes every token above zero probability eligible.
+	XTCThreshold float32
 	// RepeatPenalty penalises tokens already seen in the last RepeatLastN
 	// positions. 1 disables it, values above 1 discourage repetition.
 	RepeatPenalty float32
@@ -161,8 +174,32 @@ type CompletionOptions struct {
 	// repetition window, as in the OpenAI API.
 	PresencePenalty  float32
 	FrequencyPenalty float32
+	// DryMultiplier turns on DRY, which penalises tokens that would extend a
+	// sequence already present in the window. 0 disables it; DRY needs the
+	// model vocabulary to tokenise its breakers.
+	DryMultiplier float32
+	// DryBase is the exponential growth rate of the DRY penalty. 0 uses
+	// llama.cpp's default of 1.75.
+	DryBase float32
+	// DryAllowedLength is how long a repeated sequence may get before DRY
+	// penalises it. 0 uses the default of 2.
+	DryAllowedLength int32
+	// DryPenaltyLastN is DRY's window, following RepeatLastN: 0 uses the
+	// default of 64, -1 uses the whole context.
+	DryPenaltyLastN int32
+	// DrySequenceBreakers are the strings that restart DRY's repetition count,
+	// for example "\n" so that indentation shared with an earlier line is not
+	// penalised. Empty leaves llama.cpp with no breakers, so DRY never fires.
+	DrySequenceBreakers []string
+	// MirostatTau and MirostatEta turn on mirostat v2, which picks tokens to
+	// hold the output near a target surprise level instead of sampling from
+	// the truncated distribution. Tau is the target cross-entropy and eta the
+	// learning rate; set both, because one without the other is almost always
+	// a mistake. The truncation stages still run first.
+	MirostatTau float32
+	MirostatEta float32
 	// Seed seeds the sampler chain. Sampling is deterministic for a given
-	// seed, prompt and options.
+	// seed, prompt and options; SeedRandom asks for a fresh seed each time.
 	Seed uint32
 	// Stop halts generation when any of these strings appears in the output.
 	// The stop text is not returned.
@@ -181,6 +218,10 @@ type CompletionOptions struct {
 	IgnoreEOS bool
 }
 
+// SeedRandom asks llama.cpp for a random seed on every generation. It is
+// llama.cpp's LLAMA_DEFAULT_SEED, so a chain built with it is not reproducible.
+const SeedRandom uint32 = 0xFFFFFFFF
+
 // DefaultCompletionOptions returns sampling settings suitable for chat: a
 // little creativity, repetition suppressed, and no runaway output.
 func DefaultCompletionOptions() CompletionOptions {
@@ -192,7 +233,7 @@ func DefaultCompletionOptions() CompletionOptions {
 		MinP:          0.05,
 		RepeatPenalty: 1.1,
 		RepeatLastN:   64,
-		Seed:          0xFFFFFFFF,
+		Seed:          SeedRandom,
 		AddBOS:        true,
 	}
 }
@@ -206,24 +247,126 @@ func GreedyCompletionOptions(maxTokens int) CompletionOptions {
 // greedy reports whether the options select deterministic decoding.
 func (o CompletionOptions) greedy() bool { return o.Temperature <= 0 }
 
+// penaltiesEnabled reports whether the penalties stage has anything to do.
+// RepeatPenalty of exactly 1 is the identity divisor, so it alone means off.
+func (o CompletionOptions) penaltiesEnabled() bool {
+	repeat := o.RepeatPenalty > 0 && o.RepeatPenalty != 1
+	return repeat || o.PresencePenalty != 0 || o.FrequencyPenalty != 0
+}
+
+// repeatLastN resolves the repetition window: 0 means the documented default of
+// 64 rather than an empty window, and -1 means the whole context, which
+// llama.cpp resolves per generation.
+func (o CompletionOptions) repeatLastN() int32 {
+	if o.RepeatLastN == 0 {
+		return 64
+	}
+	return o.RepeatLastN
+}
+
+// xtcEnabled reports whether XTC would change anything. llama.cpp turns XTC
+// into a no-op when the probability is zero or the threshold is above 0.5, so
+// the stage is left out rather than added dead.
+func (o CompletionOptions) xtcEnabled() bool {
+	return o.XTCProbability > 0 && o.XTCThreshold <= 0.5
+}
+
+// mirostatEnabled reports whether mirostat v2 replaces the ordinary picker.
+func (o CompletionOptions) mirostatEnabled() bool {
+	return o.MirostatTau > 0 && o.MirostatEta > 0
+}
+
+// dryEnabled reports whether DRY should be built. DryMultiplier is the switch;
+// the other DRY fields only tune a stage that is already on.
+func (o CompletionOptions) dryEnabled() bool { return o.DryMultiplier != 0 }
+
+// dryBase resolves DRY's base, defaulting to llama.cpp's 1.75.
+func (o CompletionOptions) dryBase() float32 {
+	if o.DryBase == 0 {
+		return 1.75
+	}
+	return o.DryBase
+}
+
+// dryAllowedLength resolves how long a repeat may get before DRY penalises it,
+// defaulting to llama.cpp's 2.
+func (o CompletionOptions) dryAllowedLength() int32 {
+	if o.DryAllowedLength == 0 {
+		return 2
+	}
+	return o.DryAllowedLength
+}
+
+// validate rejects option sets that would make llama.cpp sample nonsense. NaN
+// and infinite values are caught here because every range comparison against
+// them is false, so they would otherwise reach a sampler and poison the logits
+// for the rest of the generation.
 func (o CompletionOptions) validate() error {
+	reals := []struct {
+		name string
+		v    float32
+	}{
+		{"Temperature", o.Temperature},
+		{"TopP", o.TopP},
+		{"MinP", o.MinP},
+		{"TypicalP", o.TypicalP},
+		{"TopNSigma", o.TopNSigma},
+		{"XTCProbability", o.XTCProbability},
+		{"XTCThreshold", o.XTCThreshold},
+		{"RepeatPenalty", o.RepeatPenalty},
+		{"PresencePenalty", o.PresencePenalty},
+		{"FrequencyPenalty", o.FrequencyPenalty},
+		{"DryMultiplier", o.DryMultiplier},
+		{"DryBase", o.DryBase},
+		{"MirostatTau", o.MirostatTau},
+		{"MirostatEta", o.MirostatEta},
+	}
+	for _, f := range reals {
+		if math.IsNaN(float64(f.v)) || math.IsInf(float64(f.v), 0) {
+			return errorf(ErrDecode, "%s %v is not a finite number", f.name, f.v)
+		}
+	}
+
 	switch {
 	case o.TopK < 0:
-		return fmt.Errorf("llama: TopK %d is negative", o.TopK)
+		return errorf(ErrDecode, "TopK %d is negative", o.TopK)
 	case o.TopP < 0 || o.TopP > 1:
-		return fmt.Errorf("llama: TopP %v is outside [0,1]", o.TopP)
+		return errorf(ErrDecode, "TopP %v is outside [0,1]", o.TopP)
 	case o.MinP < 0 || o.MinP > 1:
-		return fmt.Errorf("llama: MinP %v is outside [0,1]", o.MinP)
+		return errorf(ErrDecode, "MinP %v is outside [0,1]", o.MinP)
 	case o.TypicalP < 0 || o.TypicalP > 1:
-		return fmt.Errorf("llama: TypicalP %v is outside [0,1]", o.TypicalP)
+		return errorf(ErrDecode, "TypicalP %v is outside [0,1]", o.TypicalP)
+	case o.TopNSigma < 0:
+		return errorf(ErrDecode, "TopNSigma %v is negative", o.TopNSigma)
+	case o.XTCProbability < 0 || o.XTCProbability > 1:
+		return errorf(ErrDecode, "XTCProbability %v is outside [0,1]", o.XTCProbability)
+	case o.XTCThreshold < 0 || o.XTCThreshold > 1:
+		return errorf(ErrDecode, "XTCThreshold %v is outside [0,1]", o.XTCThreshold)
 	case o.RepeatPenalty < 0:
-		return fmt.Errorf("llama: RepeatPenalty %v is negative", o.RepeatPenalty)
+		return errorf(ErrDecode, "RepeatPenalty %v is negative", o.RepeatPenalty)
 	case o.RepeatLastN < -1:
-		return fmt.Errorf("llama: RepeatLastN %d is below -1", o.RepeatLastN)
+		return errorf(ErrDecode, "RepeatLastN %d is below -1", o.RepeatLastN)
+	case o.DryMultiplier < 0:
+		return errorf(ErrDecode, "DryMultiplier %v is negative", o.DryMultiplier)
+	case o.DryBase < 0 || (o.DryBase > 0 && o.DryBase < 1):
+		return errorf(ErrDecode, "DryBase %v must be at least 1 or 0 for the default", o.DryBase)
+	case o.DryAllowedLength < 0:
+		return errorf(ErrDecode, "DryAllowedLength %d is negative", o.DryAllowedLength)
+	case o.DryPenaltyLastN < -1:
+		return errorf(ErrDecode, "DryPenaltyLastN %d is below -1", o.DryPenaltyLastN)
+	case o.MirostatTau < 0 || o.MirostatEta < 0:
+		return errorf(ErrDecode, "MirostatTau %v and MirostatEta %v are negative", o.MirostatTau, o.MirostatEta)
+	case (o.MirostatTau > 0) != (o.MirostatEta > 0):
+		return errorf(ErrDecode, "MirostatTau %v and MirostatEta %v must both be set to use mirostat", o.MirostatTau, o.MirostatEta)
 	}
 	for _, s := range o.Stop {
 		if s == "" {
-			return fmt.Errorf("llama: empty stop sequence")
+			return errorf(ErrDecode, "empty stop sequence")
+		}
+	}
+	for _, b := range o.DrySequenceBreakers {
+		if b == "" {
+			return errorf(ErrDecode, "empty DRY sequence breaker")
 		}
 	}
 	return nil
