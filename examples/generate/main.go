@@ -30,6 +30,8 @@ func run() error {
 	maxTokens := flag.Int("max-tokens", 256, "maximum tokens to generate")
 	temp := flag.Float64("temp", 0, "sampling temperature (0 = greedy)")
 	raw := flag.Bool("raw", false, "skip the chat template")
+	ctxSize := flag.Uint("ctx", 0, "KV cache size in tokens (0 = the smaller of the model window and 8192)")
+	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
 	system := flag.String("system", "You are a helpful assistant.", "system prompt for the chat template")
 	flag.Parse()
 
@@ -40,13 +42,16 @@ func run() error {
 	llama.Init()
 	defer llama.Shutdown()
 
-	model, err := llama.LoadModel(*modelPath)
+	model, err := llama.LoadModel(*modelPath, llama.ModelParams{
+		GPULayers: int32(*ngl),
+		UseMmap:   true,
+	})
 	if err != nil {
 		return err
 	}
 	defer model.Close()
 
-	ctx, err := model.NewContext()
+	ctx, err := model.NewContext(llama.ContextOptions{ContextSize: uint32(*ctxSize)})
 	if err != nil {
 		return err
 	}
