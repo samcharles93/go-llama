@@ -31,7 +31,7 @@ func run() error {
 	temp := flag.Float64("temp", 0, "sampling temperature (0 = greedy)")
 	raw := flag.Bool("raw", false, "skip the chat template")
 	ctxSize := flag.Uint("ctx", 0, "KV cache size in tokens (0 = the smaller of the model window and 8192)")
-	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
+	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
 	system := flag.String("system", "You are a helpful assistant.", "system prompt for the chat template")
 	flag.Parse()
 

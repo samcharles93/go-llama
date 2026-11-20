@@ -45,7 +45,7 @@ func run() error {
 	ctxSize := flag.Uint("ctx", 0, "KV cache size per context (0 = the smaller of the model window and 8192)")
 	timeout := flag.Duration("timeout", 120*time.Second, "per-request deadline")
 	parallel := flag.Int("parallel", 1, "contexts in the generation pool")
-	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
+	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
 	apiKey := flag.String("api-key", "", "require this bearer token on /v1 routes")
 	maxQueue := flag.Int("max-queue", 0, "requests that may wait for a context (0 waits forever)")
 	maxBody := flag.Int64("max-body", 1<<20, "largest accepted request body in bytes")

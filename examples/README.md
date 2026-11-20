@@ -2,10 +2,10 @@
 
 Five runnable programs built on `go-llama/pkg/llama`. Every one of them uses the
 standard library only and needs a GGUF file; the flags all include `-ngl`, which
-defaults to 0 so a run stays on the CPU unless you ask for the GPU.
+defaults to -1: every layer goes to the GPU when one is present, and `-ngl 0` keeps
+the model on the CPU.
 
 ```
-export GOFLAGS=-buildvcs=false
 MODEL=/path/to/instruct-model.gguf
 EMBED_MODEL=/path/to/embedding-model.gguf
 ```

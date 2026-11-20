@@ -34,7 +34,7 @@ func run() error {
 	modelPath := flag.String("model", "", "path to an embedding GGUF model (required)")
 	normalize := flag.Bool("normalize", true, "scale every vector to unit length")
 	cosine := flag.Bool("cosine", false, "print the cosine similarity of exactly two inputs")
-	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
+	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
 	ctxSize := flag.Uint("ctx", 2048, "context size for the embedding context")
 	poolName := flag.String("pool", "mean", "pooling mode: mean, cls, last or none")
 	flag.Parse()

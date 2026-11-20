@@ -17,15 +17,18 @@ pkg/llama/            the library
   chatfit.go          drop old turns to fit a token budget
   metadata.go         GGUF key/value metadata
   lora.go             LoRA adapters
+  cgo.go              the only cgo flag block
   vocab.go            tokenize, detokenize, token to piece
   chat.go             chat templates
   embeddings.go       pooled embeddings
   metrics.go          llama.cpp perf counters
   logging.go          llama.cpp log bridge into slog
-  errors.go           sentinel errors and wrapping
   options.go          ModelParams, ContextOptions, CompletionOptions
-examples/             runnable programs (chat, server, embed)
-scripts/              build and test-model helpers
+  errors.go           sentinel errors and wrapping
+  doc.go              package documentation
+examples/             runnable programs (chat, server, embed, generate, tokenize)
+scripts/              build-llama.sh, cuda-toolkit.sh, fetch-test-models.sh
+docs/                 troubleshooting reference
 llama.cpp/            submodule, do not edit
 ```
 
@@ -73,6 +76,8 @@ architecture instead of detecting the GPU.
   `Sampler.Sample` therefore applies the chain itself through
   `llama_sampler_apply` and leaves accepting to the caller. The generation loop
   accepts only tokens it keeps, never the stop token.
+- **Examples default to GPU offload.** `-ngl` defaults to -1 (every layer) to match
+  `DefaultModelParams`; pass `-ngl 0` for a CPU run.
 - **Grammars.** A GBNF grammar masks logits. It is only safe when the model's
   vocabulary can spell what the grammar allows; a grammar that no token can
   satisfy makes llama.cpp abort rather than return an error, so grammars in tests

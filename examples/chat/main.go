@@ -39,7 +39,7 @@ func run() error {
 	topP := flag.Float64("top-p", 0.95, "nucleus sampling probability")
 	maxTokens := flag.Int("max-tokens", 256, "maximum tokens per reply")
 	ctxSize := flag.Uint("ctx", 0, "KV cache size in tokens (0 = the smaller of the model window and 8192)")
-	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
+	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
 	raw := flag.Bool("raw", false, "skip the chat template and send User:/Assistant: lines instead")
 	flag.Parse()
 

@@ -30,7 +30,7 @@ func main() {
 
 func run() error {
 	modelPath := flag.String("model", "", "path to a GGUF model (required)")
-	ngl := flag.Int("ngl", 0, "GPU layers to offload (0 keeps the model on the CPU)")
+	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
 	noBOS := flag.Bool("no-bos", false, "tokenize without the beginning-of-sequence token")
 	chat := flag.Bool("chat", false, "render the prompt through the chat template first")
 	system := flag.String("system", "", "system prompt for -chat")
