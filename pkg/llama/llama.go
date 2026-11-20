@@ -242,6 +242,9 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 	if o.BatchSize > 0 {
 		cParams.n_batch = C.uint32_t(o.BatchSize)
 	}
+	if o.UBatchSize > 0 {
+		cParams.n_ubatch = C.uint32_t(o.UBatchSize)
+	}
 	if o.Sequences > 0 {
 		cParams.n_seq_max = C.uint32_t(o.Sequences)
 	}
@@ -270,11 +273,13 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 	if nBatch <= 0 || nBatch > nCtx {
 		nBatch = nCtx
 	}
+	nUBatch := int(C.llama_n_ubatch(ptr))
 	c := &Context{
 		ptr:        ptr,
 		model:      m,
 		nCtx:       nCtx,
 		nBatch:     nBatch,
+		nUBatch:    nUBatch,
 		embeddings: o.Embeddings,
 		pooling:    o.Pooling,
 	}
@@ -291,6 +296,7 @@ type Context struct {
 	model      *Model
 	nCtx       int
 	nBatch     int
+	nUBatch    int
 	embeddings bool
 	pooling    PoolingType
 	batch      *Batch
@@ -312,6 +318,10 @@ func (c *Context) ContextSize() int { return c.nCtx }
 
 // BatchSize reports the largest batch the context accepts.
 func (c *Context) BatchSize() int { return c.nBatch }
+
+// UBatchSize reports the micro-batch size, which is the longest text a pooled
+// embedding can see in one piece.
+func (c *Context) UBatchSize() int { return c.nUBatch }
 
 // TokenCount reports how many tokens currently occupy the KV cache.
 func (c *Context) TokenCount() int {

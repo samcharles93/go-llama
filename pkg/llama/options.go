@@ -78,6 +78,15 @@ type ContextOptions struct {
 	// BatchSize is the largest batch handed to llama_decode. A prompt longer
 	// than this is decoded in several chunks.
 	BatchSize uint32
+	// UBatchSize is the micro-batch: the largest slab of tokens evaluated in one
+	// compute graph. It bounds the memory a decode needs, and llama.cpp caps it
+	// at 512 by default.
+	//
+	// It also bounds what pooled embeddings can see: a sequence's pooled vector
+	// is computed per micro-batch, so a text longer than UBatchSize cannot be
+	// embedded in one piece. Raise it when embedding long documents and watch the
+	// memory cost.
+	UBatchSize uint32
 	// Sequences is the number of concurrent sequences the KV cache holds.
 	Sequences uint32
 	// Threads defaults to the number of CPUs nvcc and ggml were tuned for; 0
