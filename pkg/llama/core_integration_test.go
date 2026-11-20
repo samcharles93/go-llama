@@ -379,3 +379,36 @@ func TestRestoredStateReproducesGreedyReply(t *testing.T) {
 		t.Fatalf("restored context produced %q, original produced %q", res2.Text, res1.Text)
 	}
 }
+
+func TestGrammarConstrainsOutput(t *testing.T) {
+	m := loadCoreModel(t)
+	c := newCoreContext(t, m, ContextOptions{ContextSize: 256, Threads: 4, ThreadsBatch: 4})
+
+	opts := GreedyCompletionOptions(8)
+	// Four lowercase letters is satisfiable by any BPE vocabulary, so the test does
+	// not depend on how a particular model spells "yes".
+	opts.Grammar = `root ::= [a-z]{1,4}`
+
+	res, err := c.Generate(context.Background(), "Say any word.", opts)
+	if err != nil {
+		t.Fatalf("Generate with a grammar: %v", err)
+	}
+	if res.Text == "" {
+		t.Fatal("grammar-constrained generation produced no text")
+	}
+	for _, r := range res.Text {
+		if r < 'a' || r > 'z' {
+			t.Fatalf("grammar allowed %q in %q, only lowercase letters were legal", r, res.Text)
+		}
+	}
+	if len(res.Text) > 4 {
+		t.Fatalf("generated %q, the grammar caps it at four letters", res.Text)
+	}
+
+	// A malformed grammar is rejected before any decode.
+	bad := GreedyCompletionOptions(4)
+	bad.Grammar = `root ::= [unclosed`
+	if _, err := c.Generate(context.Background(), "x", bad); !errors.Is(err, ErrGrammar) {
+		t.Fatalf("Generate with a broken grammar = %v, want ErrGrammar", err)
+	}
+}

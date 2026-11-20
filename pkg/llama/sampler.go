@@ -3,6 +3,35 @@ package llama
 /*
 #include "llama.h"
 #include <stdlib.h>
+
+// sample_chain applies the sampler chain to the context's logits for one
+// position and returns the selected token without accepting it. It exists as C
+// because llama_token_data_array points at a candidate array, and a Go array
+// nested inside a Go struct cannot be handed to cgo.
+//
+// The buffer has one entry per vocabulary item and is owned by the caller, so a
+// generation loop allocates it once instead of once per token.
+static llama_token sample_chain(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx, struct llama_token_data * buf, int32_t n_vocab) {
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (logits == NULL) {
+        return -1;
+    }
+    for (int32_t i = 0; i < n_vocab; i++) {
+        buf[i].id    = i;
+        buf[i].logit = logits[i];
+        buf[i].p     = 0.0f;
+    }
+    struct llama_token_data_array cur = { buf, (size_t) n_vocab, -1, false };
+    llama_sampler_apply(smpl, &cur);
+    if (cur.selected < 0 || cur.selected >= n_vocab) {
+        return -1;
+    }
+    return buf[cur.selected].id;
+}
+
+static struct llama_token_data * alloc_candidates(int32_t n_vocab) {
+    return (struct llama_token_data *) calloc((size_t) n_vocab, sizeof(struct llama_token_data));
+}
 */
 import "C"
 
@@ -344,13 +373,78 @@ func (s *Sampler) AddDist(seed uint32) *Sampler {
 	return s
 }
 
-// Sample picks the next token. idx is the index into the last decoded batch,
-// with -1 meaning the final token.
+// candidateBuffer holds one llama_token_data per vocabulary item in C memory,
+// which is what the sample path hands to llama_sampler_apply.
+type candidateBuffer struct {
+	ptr    *C.struct_llama_token_data
+	nVocab int32
+}
+
+func newCandidateBuffer(nVocab int) (*candidateBuffer, error) {
+	if nVocab <= 0 {
+		return nil, errorf(ErrDecode, "model vocabulary is empty")
+	}
+	ptr := C.alloc_candidates(C.int32_t(nVocab))
+	if ptr == nil {
+		return nil, errorf(ErrDecode, "out of memory allocating %d sampling candidates", nVocab)
+	}
+	return &candidateBuffer{ptr: ptr, nVocab: int32(nVocab)}, nil
+}
+
+func (b *candidateBuffer) free() {
+	if b != nil && b.ptr != nil {
+		C.free(unsafe.Pointer(b.ptr))
+		b.ptr = nil
+	}
+}
+
+// Sample picks the next token for the context's last decoded position, without
+// feeding it back into the chain. Call Accept for every token you take, or the
+// repetition and grammar state drift.
+//
+// It deliberately does not use llama_sampler_sample: that function applies the
+// chain, picks a token and accepts it in one call, so a caller following the
+// documented sample-then-accept pattern would accept every token twice. Double
+// acceptance double-counts the penalties and drives a grammar sampler past the
+// end of its grammar, where llama.cpp throws a C++ exception that aborts the
+// process. Apply, select and accept stay separate here for that reason.
 func (s *Sampler) Sample(c *Context, idx int32) Token {
-	if s == nil || s.sampler == nil || c == nil || c.ptr == nil {
+	if c == nil || c.model == nil {
 		return -1
 	}
-	return Token(C.llama_sampler_sample(s.sampler, c.ptr, C.int32_t(idx)))
+	buf, err := newCandidateBuffer(c.model.vocab.Size())
+	if err != nil {
+		return -1
+	}
+	defer buf.free()
+	token, err := s.sampleWith(c, idx, buf)
+	if err != nil {
+		return -1
+	}
+	return token
+}
+
+// sampleWith is Sample with a caller-supplied candidate buffer, so a generation
+// loop does not reallocate a vocabulary-sized array for every token.
+func (s *Sampler) sampleWith(c *Context, idx int32, buf *candidateBuffer) (Token, error) {
+	if s == nil || s.sampler == nil {
+		return -1, errorf(ErrDecode, "sampler is closed")
+	}
+	if c == nil || c.ptr == nil || c.model == nil {
+		return -1, ErrClosed
+	}
+	if buf == nil || buf.ptr == nil {
+		return -1, errorf(ErrDecode, "no sampling buffer")
+	}
+	if C.llama_get_logits_ith(c.ptr, C.int32_t(idx)) == nil {
+		return -1, errorf(ErrDecode, "no logits for position %d (was the prompt decoded?)", idx)
+	}
+
+	token := C.sample_chain(s.sampler, c.ptr, C.int32_t(idx), buf.ptr, C.int32_t(buf.nVocab))
+	if token < 0 {
+		return -1, errorf(ErrDecode, "the sampler selected no token, so a grammar or filter excluded every candidate")
+	}
+	return Token(token), nil
 }
 
 // Accept feeds a token back into the chain so penalties and grammar state stay

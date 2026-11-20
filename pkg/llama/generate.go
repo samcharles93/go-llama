@@ -186,6 +186,13 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 		extraStops[t] = struct{}{}
 	}
 	eos := c.model.vocab.EOS()
+	// Reused for every token: the candidate array is one entry per vocabulary
+	// item, so reallocating it per token would be the slowest part of sampling.
+	cands, err := newCandidateBuffer(c.model.vocab.Size())
+	if err != nil {
+		return res, err
+	}
+	defer cands.free()
 
 	var text strings.Builder
 	for {
@@ -203,12 +210,16 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 			return res, wrap(ErrDecode, "generate", err)
 		}
 
-		token := sampler.Sample(c, -1)
-		if token < 0 {
-			return res, errorf(ErrDecode, "sampler returned an invalid token")
+		token, serr := sampler.sampleWith(c, -1, cands)
+		if serr != nil {
+			return res, serr
 		}
-		sampler.Accept(token)
 
+		// Stopping tokens are checked before Accept, the way llama.cpp's own
+		// examples do it. Feeding an end-of-generation token to a grammar sampler
+		// that has already reached its end drives llama.cpp into
+		// "Unexpected empty grammar stack", which throws a C++ exception and
+		// aborts the process.
 		if _, ok := extraStops[token]; ok {
 			res.Tokens = append(res.Tokens, token)
 			res.StopReason = StopReasonStopToken
@@ -219,6 +230,7 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 			res.StopReason = StopReasonEOS
 			break
 		}
+		sampler.Accept(token)
 
 		piece, perr := c.model.vocab.TokenToPiece(token)
 		if perr != nil {

@@ -11,8 +11,12 @@ pkg/llama/            the library
   llama.go            backend lifecycle, Model, Context
   generate.go         Generate, Stream (iter.Seq2), KV-cache reuse
   batch.go            capacity-checked token batches
-  sampler.go          sampler chains built from CompletionOptions
+  sampler.go          sampler chains built from CompletionOptions, sampling
   stop.go             stop-sequence matcher with holdback
+  session.go          SaveState/LoadState, Truncate, History
+  chatfit.go          drop old turns to fit a token budget
+  metadata.go         GGUF key/value metadata
+  lora.go             LoRA adapters
   vocab.go            tokenize, detokenize, token to piece
   chat.go             chat templates
   embeddings.go       pooled embeddings
@@ -61,6 +65,18 @@ architecture instead of detecting the GPU.
   documented order: 1 debug, 2 info, 3 warn, 4 error.
 - **Streaming.** `Stream` returns `iter.Seq2[string, error]` rather than a
   channel: breaking out of the loop stops generation with no goroutine to leak.
+- **Sampling is apply, select, accept.** `llama_sampler_sample` in this pinned
+  llama.cpp applies the chain, selects a token and *accepts* it in one call. Using
+  it and then calling `Sampler.Accept` accepts every token twice, which
+  double-counts penalties and pushes a grammar sampler past the end of its
+  grammar, where llama.cpp throws a C++ exception that aborts the process.
+  `Sampler.Sample` therefore applies the chain itself through
+  `llama_sampler_apply` and leaves accepting to the caller. The generation loop
+  accepts only tokens it keeps, never the stop token.
+- **Grammars.** A GBNF grammar masks logits. It is only safe when the model's
+  vocabulary can spell what the grammar allows; a grammar that no token can
+  satisfy makes llama.cpp abort rather than return an error, so grammars in tests
+  stay permissive.
 
 ## Conventions
 
