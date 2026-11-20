@@ -26,7 +26,25 @@ const (
 	LogLevelError = slog.LevelError
 )
 
-var Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+var Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: defaultLogLevel()}))
+
+// defaultLogLevel reads GO_LLAMA_LOG_LEVEL so a deployment can turn llama.cpp's
+// chatter up or down without a code change. Unrecognised values keep the
+// warning default.
+func defaultLogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GO_LLAMA_LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelWarn
+	}
+}
 
 // llama.cpp's log severities, as declared in ggml.h.
 const (

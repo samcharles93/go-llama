@@ -220,3 +220,68 @@ func TestCloseIsIdempotentAndOrdered(t *testing.T) {
 		t.Fatalf("Close on empty context: %v", err)
 	}
 }
+
+// FuzzBatchAdd checks the capacity guard the old implementation lacked: whatever
+// sequence of adds arrives, the batch must never write past its allocation and
+// must report ErrBatchFull once it is full.
+func FuzzBatchAdd(f *testing.F) {
+	f.Add(int64(2), int64(1), int64(3), int64(1))
+	f.Add(int64(1), int64(2), int64(1), int64(2))
+	f.Add(int64(4), int64(1), int64(6), int64(1))
+	f.Add(int64(3), int64(1), int64(2), int64(5))
+	f.Fuzz(func(t *testing.T, capacity64, nSeq64, adds64, seqIDs64 int64) {
+		if capacity64 <= 0 || capacity64 > 64 || nSeq64 <= 0 || nSeq64 > 4 {
+			t.Skip()
+		}
+		capacity, nSeq := int32(capacity64), int32(nSeq64)
+
+		b, err := NewBatch(capacity, nSeq)
+		if err != nil {
+			t.Skip()
+		}
+		defer b.Close()
+
+		nIDs := int32(seqIDs64)
+		if nIDs < 1 {
+			nIDs = 1
+		}
+		if nIDs > nSeq+1 {
+			nIDs = nSeq + 1
+		}
+		ids := make([]int32, nIDs)
+		for i := range ids {
+			ids[i] = int32(i)
+		}
+
+		total := adds64
+		if total < 0 {
+			total = -total
+		}
+		if total > int64(capacity)+3 {
+			total = int64(capacity) + 3
+		}
+
+		var accepted int32
+		for i := int32(0); i < int32(total); i++ {
+			err := b.Add(Token(i), i, ids, true)
+			switch {
+			case nIDs > nSeq:
+				if err == nil {
+					t.Fatalf("Add with %d sequence ids on a %d-sequence batch returned nil", nIDs, nSeq)
+				}
+			case accepted >= capacity:
+				if !errors.Is(err, ErrBatchFull) {
+					t.Fatalf("Add %d past capacity %d = %v, want ErrBatchFull", accepted, capacity, err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Add %d within capacity %d = %v", accepted, capacity, err)
+				}
+				accepted++
+			}
+		}
+		if got := int32(b.Len()); got != accepted {
+			t.Fatalf("Len = %d, want %d", got, accepted)
+		}
+	})
+}
