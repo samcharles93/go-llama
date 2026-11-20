@@ -301,3 +301,48 @@ func TestHybridModelFallsBackToFullRecompute(t *testing.T) {
 		t.Fatalf("ReusedTokens = %d, want 0 for a model that cannot trim its state", res.ReusedTokens)
 	}
 }
+
+func TestFitMessagesDropsOldestTurnsAndKeepsSystem(t *testing.T) {
+	m := loadCoreModel(t)
+
+	system := SystemMessage("Answer in one word.")
+	msgs := []ChatMessage{system}
+	for range 12 {
+		msgs = append(msgs, UserMessage("padding padding padding padding padding padding"))
+		msgs = append(msgs, AssistantMessage("ok"))
+	}
+	msgs = append(msgs, UserMessage("last question?"))
+
+	fitted, err := m.FitMessages(msgs, 256)
+	if err != nil {
+		t.Fatalf("FitMessages: %v", err)
+	}
+	if len(fitted) >= len(msgs) {
+		t.Fatalf("FitMessages returned %d messages from %d, expected truncation", len(fitted), len(msgs))
+	}
+	if fitted[0].Role != "system" || fitted[0].Content != system.Content {
+		t.Fatalf("system message was dropped or reordered: %+v", fitted[0])
+	}
+	if last := fitted[len(fitted)-1]; last.Content != "last question?" {
+		t.Fatalf("newest turn was dropped: %+v", last)
+	}
+
+	prompt, err := m.ApplyChatTemplate(fitted, true)
+	if err != nil {
+		t.Fatalf("ApplyChatTemplate: %v", err)
+	}
+	n, err := m.CountTokens(prompt, true)
+	if err != nil {
+		t.Fatalf("CountTokens: %v", err)
+	}
+	if n > 256 {
+		t.Fatalf("fitted prompt is %d tokens, budget was 256", n)
+	}
+
+	if _, err := m.FitMessages(msgs, 4); err == nil {
+		t.Fatal("FitMessages with an impossible budget returned no error")
+	}
+	if _, err := m.FitMessages(msgs, 0); err == nil {
+		t.Fatal("FitMessages with a zero budget returned no error")
+	}
+}

@@ -361,19 +361,27 @@ func (c *Context) scratchBatch(n int) (*Batch, error) {
 }
 
 // decode hands a batch to llama.cpp, translating its status codes into errors.
+//
+// llama.cpp documents the return values as 0 success, 1 no KV slot, 2 aborted,
+// -1 invalid batch, and anything below -1 a fatal error after which the memory
+// state is left inconsistent. A fatal error therefore clears the cache and the
+// history, so the next generation starts from a known state instead of failing
+// forever.
 func (c *Context) decode(b *Batch) error {
 	rc := C.llama_decode(c.ptr, b.batch)
-	switch rc {
-	case 0:
+	switch {
+	case rc == 0:
 		return nil
-	case 1:
-		return errorf(ErrDecode, "llama_decode could not find a KV cache slot (context full at %d tokens)", c.nCtx)
-	case 2:
-		return errorf(ErrDecode, "llama_decode could not allocate a compute buffer")
-	case -1:
+	case rc == 1:
+		return errorf(ErrContextFull, "llama_decode found no KV cache slot for %d tokens (context holds %d)", b.Len(), c.nCtx)
+	case rc == 2:
+		return errorf(ErrDecode, "llama_decode was aborted")
+	case rc == -1:
 		return errorf(ErrDecode, "llama_decode rejected the batch (invalid token id or position)")
 	default:
-		return errorf(ErrDecode, "llama_decode failed with code %d", rc)
+		C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
+		c.history = c.history[:0]
+		return errorf(ErrDecode, "llama_decode failed with code %d; the context was reset", rc)
 	}
 }
 
