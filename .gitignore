@@ -1,0 +1,15 @@
+# llama.cpp build output (the submodule is checked out, its build tree is not)
+llama.cpp/build/
+.cache/
+.build.log
+bin/
+
+# Downloaded GGUF test models
+models/
+*.gguf
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
