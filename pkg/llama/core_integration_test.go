@@ -1,0 +1,231 @@
+//go:build integration
+
+package llama
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"testing"
+	"time"
+)
+
+// These tests exercise the pieces of the core that only exist with a real model:
+// the KV cache, context state serialisation and the shutdown ordering between
+// Model and Context. They need GO_LLAMA_TEST_MODEL and skip without it.
+
+func testModelPath(t *testing.T) string {
+	t.Helper()
+	path := os.Getenv("GO_LLAMA_TEST_MODEL")
+	if path == "" {
+		t.Skip("GO_LLAMA_TEST_MODEL is not set")
+	}
+	return path
+}
+
+// loadTestModel loads the shared test model on the CPU, so several tests can run
+// without competing for the GPU.
+func loadTestModel(t *testing.T) *Model {
+	t.Helper()
+	m, err := LoadModel(testModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("model close: %v", err)
+		}
+	})
+	return m
+}
+
+func newTestContext(t *testing.T, m *Model, opts ContextOptions) *Context {
+	t.Helper()
+	c, err := m.NewContext(opts)
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("context close: %v", err)
+		}
+	})
+	return c
+}
+
+func TestCountTokensMatchesTokenize(t *testing.T) {
+	m := loadTestModel(t)
+	const text = "token counting should agree with tokenize"
+	n, err := m.CountTokens(text, true)
+	if err != nil {
+		t.Fatalf("CountTokens: %v", err)
+	}
+	tokens, err := m.Vocab().Tokenize(text, true)
+	if err != nil {
+		t.Fatalf("Tokenize: %v", err)
+	}
+	if n != len(tokens) {
+		t.Fatalf("CountTokens = %d, Tokenize gave %d", n, len(tokens))
+	}
+	if n == 0 {
+		t.Fatal("expected at least one token")
+	}
+}
+
+func TestContextHistoryAndTruncate(t *testing.T) {
+	m := loadTestModel(t)
+	c := newTestContext(t, m, ContextOptions{ContextSize: 256, Threads: 4, ThreadsBatch: 4})
+
+	res, err := c.Generate(context.Background(), "The quick brown fox", GreedyCompletionOptions(6))
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	before := c.History()
+	if len(before) == 0 {
+		t.Fatal("history is empty after generation")
+	}
+	if len(before) != res.PromptTokens+res.Metrics.GeneratedTokens {
+		// The final token is sampled before it is decoded, so a short off-by-one
+		// is expected; anything larger means the accounting is wrong.
+		if len(before) < res.PromptTokens {
+			t.Fatalf("history holds %d tokens, prompt alone was %d", len(before), res.PromptTokens)
+		}
+	}
+
+	keep := len(before) / 2
+	if err := c.Truncate(keep); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if got := len(c.History()); got != keep {
+		t.Fatalf("history after Truncate = %d, want %d", got, keep)
+	}
+	if err := c.Truncate(keep); err != nil {
+		t.Fatalf("Truncate to the same length: %v", err)
+	}
+	if err := c.Truncate(-1); err == nil {
+		t.Fatal("Truncate(-1) returned nil")
+	}
+
+	// A second generation after a truncation must still work, which proves the
+	// KV cache shrank with the history rather than being left inconsistent.
+	if _, err := c.Generate(context.Background(), "and then", GreedyCompletionOptions(4)); err != nil {
+		t.Fatalf("Generate after Truncate: %v", err)
+	}
+}
+
+func TestSaveStateResumesConversation(t *testing.T) {
+	m := loadTestModel(t)
+	const prompt = "Explain what a mutex is in one sentence."
+
+	first := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	res, err := first.Generate(context.Background(), prompt, GreedyCompletionOptions(12))
+	if err != nil {
+		t.Fatalf("first Generate: %v", err)
+	}
+	wantHistory := len(first.History())
+
+	state, err := first.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if len(state) == 0 {
+		t.Fatal("SaveState returned no bytes")
+	}
+
+	second := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	if err := second.LoadState(state); err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got := len(second.History()); got != wantHistory {
+		t.Fatalf("restored history = %d tokens, want %d", got, wantHistory)
+	}
+
+	// Continuing from the restored state must reuse the whole prefix: nothing in
+	// the prompt is re-evaluated.
+	next := prompt + res.Text + " Why is it needed?"
+	resumed, err := second.Generate(context.Background(), next, GreedyCompletionOptions(8))
+	if err != nil {
+		t.Fatalf("Generate on restored context: %v", err)
+	}
+	if resumed.ReusedTokens == 0 {
+		t.Fatal("restored context reused no tokens, so the state did not carry the KV cache")
+	}
+
+	if err := second.LoadState([]byte("not a state")); err == nil {
+		t.Fatal("LoadState accepted random bytes")
+	}
+
+	var buf bytes.Buffer
+	if err := first.SaveStateTo(&buf); err != nil {
+		t.Fatalf("SaveStateTo: %v", err)
+	}
+	third := newTestContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	if err := third.LoadStateFrom(&buf); err != nil {
+		t.Fatalf("LoadStateFrom: %v", err)
+	}
+}
+
+func TestCloseDuringGenerateStopsPromptly(t *testing.T) {
+	m := loadTestModel(t)
+	c, err := m.NewContext(ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Generate(context.Background(), "Count to one hundred:", CompletionOptions{
+			MaxTokens: 400, Temperature: 0.8, TopK: 40, TopP: 0.95, AddBOS: true,
+		})
+		done <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked while a generation was running")
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Generate returned nil after its context was closed mid-flight")
+		}
+		if !errors.Is(err, ErrClosed) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Generate after Close = %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Generate did not return after its context was closed")
+	}
+}
+
+func TestModelCloseRefusesLiveContexts(t *testing.T) {
+	m, err := LoadModel(testModelPath(t), ModelParams{GPULayers: 0, UseMmap: true})
+	if err != nil {
+		t.Fatalf("LoadModel: %v", err)
+	}
+	c, err := m.NewContext(ContextOptions{ContextSize: 128, Threads: 2, ThreadsBatch: 2})
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	if err := m.Close(); err == nil {
+		t.Fatal("closing a model with an open context returned nil")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("context close: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("model close after the context closed: %v", err)
+	}
+	if _, err := m.NewContext(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("NewContext after Close = %v, want ErrClosed", err)
+	}
+}

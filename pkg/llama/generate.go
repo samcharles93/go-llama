@@ -171,6 +171,14 @@ func (c *Context) generate(ctx context.Context, prompt string, opts CompletionOp
 
 	var text strings.Builder
 	for {
+		// Close sets the flag before waiting for the lock, so a reply long
+		// enough to outlive its owner stops here instead of blocking Close.
+		if c.closed.Load() {
+			res.StopReason = StopReasonCancelled
+			res.Text = text.String()
+			res.Metrics = c.metrics()
+			return res, ErrClosed
+		}
 		if err := ctx.Err(); err != nil {
 			res.StopReason = StopReasonCancelled
 			res.Metrics = c.metrics()

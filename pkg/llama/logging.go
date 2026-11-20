@@ -28,6 +28,16 @@ const (
 
 var Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
+// llama.cpp's log severities, as declared in ggml.h.
+const (
+	levelNone  = 0
+	levelDebug = 1
+	levelInfo  = 2
+	levelWarn  = 3
+	levelError = 4
+	levelCont  = 5
+)
+
 var (
 	logMu      sync.Mutex
 	pending    strings.Builder
@@ -70,7 +80,13 @@ func goLogBridge(level C.int, text *C.char, _ unsafe.Pointer) {
 	if text == nil {
 		return
 	}
-	msg := C.GoString(text)
+	handleLogFragment(int(level), C.GoString(text))
+}
+
+// handleLogFragment assembles one llama.cpp log fragment. It is split out of the
+// cgo bridge so the level mapping and the continuation rules are testable
+// without a live backend.
+func handleLogFragment(level int, msg string) {
 	if msg == "" {
 		return
 	}
@@ -78,23 +94,16 @@ func goLogBridge(level C.int, text *C.char, _ unsafe.Pointer) {
 	logMu.Lock()
 	defer logMu.Unlock()
 
-	const (
-		levelNone  = 0
-		levelDebug = 1
-		levelInfo  = 2
-		levelWarn  = 3
-		levelError = 4
-		levelCont  = 5
-	)
-
-	lvl := int(level)
+	lvl := level
 	if lvl != levelCont {
 		flushPendingLocked()
 		pendingLvl = lvl
 	}
 	pending.WriteString(msg)
-	if lvl != levelCont && !strings.HasSuffix(msg, "\n") {
-		// The fragment is incomplete: wait for its continuation.
+	if !strings.HasSuffix(msg, "\n") {
+		// No newline yet, so the message is still being written. A following
+		// fragment with a level of its own flushes it, and FlushLogs covers the
+		// case where the last message never gets one.
 		havePend = true
 		return
 	}
@@ -128,15 +137,15 @@ func emitLog(level int, raw string) {
 	}
 	attrs := []any{"source", "llama.cpp"}
 	switch level {
-	case 1: // GGML_LOG_LEVEL_DEBUG
+	case levelDebug:
 		Logger.Debug(body, attrs...)
-	case 2: // GGML_LOG_LEVEL_INFO
+	case levelInfo:
 		Logger.Info(body, attrs...)
-	case 3: // GGML_LOG_LEVEL_WARN
+	case levelWarn:
 		Logger.Warn(body, attrs...)
-	case 4: // GGML_LOG_LEVEL_ERROR
+	case levelError:
 		Logger.Error(body, attrs...)
-	default: // GGML_LOG_LEVEL_NONE and anything unexpected
+	default:
 		Logger.Info(body, attrs...)
 	}
 }

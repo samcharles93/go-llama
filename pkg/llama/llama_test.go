@@ -3,6 +3,8 @@ package llama
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync"
 	"testing"
 )
 
@@ -129,5 +131,92 @@ func TestGenerateRequiresLiveContext(t *testing.T) {
 	c := &Context{}
 	if _, err := c.Generate(context.Background(), "hi", GreedyCompletionOptions(4)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Generate on closed context = %v, want ErrClosed", err)
+	}
+}
+
+// logRecorder captures the records the log bridge emits.
+type logRecorder struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (h *logRecorder) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+func (h *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logRecorder) WithGroup(string) slog.Handler      { return h }
+
+func (h *logRecorder) take() []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := h.records
+	h.records = nil
+	return out
+}
+
+func TestLogBridgeMapsSeverities(t *testing.T) {
+	rec := &logRecorder{}
+	SetLogger(slog.New(rec))
+	defer SetLogger(nil)
+
+	cases := map[int]slog.Level{
+		levelDebug: slog.LevelDebug,
+		levelInfo:  slog.LevelInfo,
+		levelWarn:  slog.LevelWarn,
+		levelError: slog.LevelError,
+	}
+	for level, want := range cases {
+		handleLogFragment(level, "message at level\n")
+		got := rec.take()
+		if len(got) != 1 {
+			t.Fatalf("level %d produced %d records, want 1", level, len(got))
+		}
+		if got[0].Level != want {
+			t.Errorf("level %d mapped to %v, want %v", level, got[0].Level, want)
+		}
+		if got[0].Message != "message at level" {
+			t.Errorf("level %d message = %q", level, got[0].Message)
+		}
+	}
+}
+
+func TestLogBridgeAssemblesContinuations(t *testing.T) {
+	rec := &logRecorder{}
+	SetLogger(slog.New(rec))
+	defer SetLogger(nil)
+
+	handleLogFragment(levelWarn, "first half ")
+	handleLogFragment(levelCont, "second half")
+	if got := rec.take(); len(got) != 0 {
+		t.Fatalf("emitted %d records before the message ended: %v", len(got), got)
+	}
+	handleLogFragment(levelCont, "\n")
+	got := rec.take()
+	if len(got) != 1 {
+		t.Fatalf("emitted %d records, want 1", len(got))
+	}
+	if got[0].Message != "first half second half" {
+		t.Fatalf("assembled message = %q", got[0].Message)
+	}
+	if got[0].Level != slog.LevelWarn {
+		t.Fatalf("continuation changed severity to %v", got[0].Level)
+	}
+}
+
+func TestCloseIsIdempotentAndOrdered(t *testing.T) {
+	m := &Model{path: "test"}
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close on empty model: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	c := &Context{}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close on empty context: %v", err)
 	}
 }

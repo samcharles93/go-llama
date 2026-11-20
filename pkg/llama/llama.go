@@ -80,13 +80,16 @@ type Model struct {
 	path   string
 	params ModelParams
 
-	nCtxTrain  int
-	nEmbdOut   int
-	nParams    uint64
-	desc       string
-	closed     atomic.Bool
-	closeOnce  sync.Once
-	contextCnt atomic.Int64
+	nCtxTrain int
+	nEmbdOut  int
+	nParams   uint64
+	desc      string
+
+	// mu guards contexts and the free of ptr. closed is atomic so hot paths can
+	// test it without taking the lock.
+	mu       sync.Mutex
+	closed   atomic.Bool
+	contexts int
 }
 
 // LoadModel loads a GGUF file. Callers usually pass no params, which loads every
@@ -144,6 +147,19 @@ func LoadModel(path string, params ...ModelParams) (*Model, error) {
 // Vocab returns the tokenizer. It stays valid until the model is closed.
 func (m *Model) Vocab() *Vocab { return m.vocab }
 
+// CountTokens reports how many tokens text occupies, which is what a server
+// needs to decide whether a conversation still fits in the context.
+func (m *Model) CountTokens(text string, addSpecial bool) (int, error) {
+	if m == nil || m.Vocab() == nil {
+		return 0, ErrClosed
+	}
+	tokens, err := m.vocab.Tokenize(text, addSpecial)
+	if err != nil {
+		return 0, err
+	}
+	return len(tokens), nil
+}
+
 // Path reports the file the model was loaded from.
 func (m *Model) Path() string { return m.path }
 
@@ -166,7 +182,14 @@ func (m *Model) LoadParams() ModelParams { return m.params }
 // NewContext creates a context for this model. Callers usually pass nothing,
 // which gives a chat-ready context sized to the model's trained window.
 func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
-	if m == nil || m.closed.Load() {
+	if m == nil {
+		return nil, ErrClosed
+	}
+	// Context creation touches the model pointer and the context count, so it
+	// takes the same lock Close does.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
 		return nil, ErrClosed
 	}
 	o := DefaultContextOptions()
@@ -218,7 +241,7 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 		embeddings: o.Embeddings,
 		pooling:    o.Pooling,
 	}
-	m.contextCnt.Add(1)
+	m.contexts++
 	return c, nil
 }
 
@@ -275,15 +298,20 @@ func (c *Context) Close() error {
 	if c == nil || c.closed.Swap(true) {
 		return nil
 	}
-	// Take the lock so a generation running in another goroutine finishes
-	// against a live context.
+	// Generation checks the closed flag on every token, so waiting for the lock
+	// returns promptly instead of blocking for the rest of a long reply.
 	c.mu.Lock()
 	if c.ptr != nil {
 		C.llama_free(c.ptr)
 		c.ptr = nil
 	}
 	c.mu.Unlock()
-	c.model.contextCnt.Add(-1)
+
+	if c.model != nil {
+		c.model.mu.Lock()
+		c.model.contexts--
+		c.model.mu.Unlock()
+	}
 	return nil
 }
 
@@ -295,21 +323,23 @@ func (c *Context) Free() { _ = c.Close() }
 // Close frees the model. Contexts created from it must be closed first; the
 // model refuses to free while they are open.
 func (m *Model) Close() error {
-	if m == nil || m.closed.Swap(true) {
+	if m == nil {
 		return nil
 	}
-	var err error
-	m.closeOnce.Do(func() {
-		if n := m.contextCnt.Load(); n > 0 {
-			m.closed.Store(false)
-			err = errorf(ErrClosed, "model %s still has %d open context(s)", m.path, n)
-			return
-		}
-		C.llama_model_free(m.ptr)
-		m.ptr = nil
-		openModels.Add(-1)
-	})
-	return err
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed.Load() {
+		return nil
+	}
+	if m.contexts > 0 {
+		// Freeing now would leave every live context pointing at freed weights.
+		return errorf(ErrClosed, "model %s still has %d open context(s); close them first", m.path, m.contexts)
+	}
+	m.closed.Store(true)
+	C.llama_model_free(m.ptr)
+	m.ptr = nil
+	openModels.Add(-1)
+	return nil
 }
 
 // Free is Close, kept for callers written against the old API.
