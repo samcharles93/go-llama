@@ -293,11 +293,14 @@ func cosine(a, b []float32) float64 {
 }
 ```
 
-`EmbedBatch` submits every text as its own sequence, so the context needs at least
-that many sequences; a `ContextOptions.Sequences` that is too small returns an
-error naming the limit. Pooled embeddings are computed per micro-batch, so a text
-longer than `ContextOptions.UBatchSize` (512 by default) cannot be embedded in one
-piece: raise `UBatchSize` for long documents.
+`EmbedBatch` decodes one text at a time. Submitting several texts as one
+multi-sequence batch looks tempting and is wrong: llama.cpp pools a sequence's
+embedding per micro-batch, and sequences of different lengths in one decode come
+back pooled with the wrong token set (measured on a Qwen2 0.5B model, one sequence
+of three texts was off by a cosine of 0.56 while the other two matched exactly).
+Pooled embeddings are computed per micro-batch, so a text longer than
+`ContextOptions.UBatchSize` (512 by default) cannot be embedded in one piece: raise
+`UBatchSize` for long documents, and `Embed` returns an error naming it otherwise.
 
 An embedding context must set `Embeddings: true`; a chat context cannot be reused
 for embeddings. `PoolingMean`, `PoolingCLS` and `PoolingLast` need a model trained

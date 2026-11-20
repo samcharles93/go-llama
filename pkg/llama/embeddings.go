@@ -8,6 +8,8 @@ import "C"
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"unsafe"
 )
@@ -39,18 +41,16 @@ func (c *Context) Embed(ctx context.Context, text string) ([]float32, error) {
 	return vecs[0], nil
 }
 
-// EmbedBatch embeds several texts. With pooling enabled the texts are decoded
-// together, one sequence per text, so a batch of short texts costs one pass
-// through the model instead of one pass each. The context must be created with
-// ContextOptions.Sequences at least as large as len(texts).
+// EmbedBatch embeds several texts, one decode per text, reusing the same KV
+// cache.
 //
-// With PoolingNone there is no per-sequence vector to read, so the texts are
-// decoded one at a time instead.
-//
-// Like Embed, each call clears the KV cache, so the context cannot serve chat at
-// the same time. The context lock is held for the whole call, so a batch is not
-// cancellable inside a decode: cancellation is checked between texts and between
-// groups of texts.
+// The texts are not submitted as one multi-sequence batch. llama.cpp pools a
+// sequence's embedding per micro-batch, and when a decode carries sequences of
+// different lengths the sequences grouped with a shorter one come back pooled
+// with the wrong token set: measured on a Qwen2 0.5B model, sequences 0 and 2 of
+// lengths 3 and 3 matched their single-text vector exactly while the middle
+// sequence of length 4 was off by a cosine of 0.56. A wrong vector is worse than
+// a fast one, so each text gets its own decode.
 func (c *Context) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	if c == nil || c.closed.Load() {
 		return nil, ErrClosed
@@ -69,111 +69,16 @@ func (c *Context) EmbedBatch(ctx context.Context, texts []string) ([][]float32, 
 		return nil, errorf(ErrEmbedding, "model %s has no embedding output", c.model.path)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.ptr == nil {
-		return nil, ErrClosed
-	}
-	if len(texts) == 0 {
-		return nil, nil
-	}
-	if c.poolingType() == PoolingNone {
-		return c.embedSequential(ctx, texts, nEmbd)
-	}
-	return c.embedPooled(ctx, texts, nEmbd)
-}
-
-// poolingType reports the pooling the context actually uses. ContextOptions
-// leaves it unspecified by default, and llama.cpp then takes the model's own
-// pooling_type, so ContextOptions.Pooling is not the answer.
-func (c *Context) poolingType() PoolingType {
-	return PoolingType(int32(C.llama_pooling_type(c.ptr)))
-}
-
-// embedPooled decodes every text as its own sequence and reads back the pooled
-// vector of each. Callers hold c.mu.
-//
-// llama.cpp pools a sequence inside one micro-batch and keeps only the micro-batch
-// that last touched the sequence, so a sequence split across micro-batches would
-// be pooled from its tail alone. The texts are therefore grouped so that a group
-// fits the micro-batch, and each group is decoded in one call.
-func (c *Context) embedPooled(ctx context.Context, texts []string, nEmbd int) ([][]float32, error) {
-	nSeqMax := int(C.llama_n_seq_max(c.ptr))
-	if len(texts) > nSeqMax {
-		return nil, errorf(ErrEmbedding, "cannot embed %d texts in one batch: the context holds %d sequences, so ContextOptions.Sequences must be at least %d", len(texts), nSeqMax, len(texts))
-	}
-	limit := min(int(C.llama_n_ubatch(c.ptr)), c.nBatch)
-
-	tokens := make([][]Token, len(texts))
-	for i, text := range texts {
-		if err := ctx.Err(); err != nil {
-			return nil, wrap(ErrEmbedding, "embed", err)
-		}
-		seq, err := c.model.vocab.Tokenize(text, true)
-		if err != nil {
-			return nil, err
-		}
-		if len(seq) == 0 {
-			return nil, errorf(ErrEmbedding, "text %d produced no tokens", i)
-		}
-		if len(seq) > limit {
-			return nil, errorf(ErrEmbedding, "text %d is %d tokens, but pooled embeddings need the whole text in one llama.cpp micro-batch of %d tokens (512 by default)", i, len(seq), limit)
-		}
-		tokens[i] = seq
-	}
-
-	batch, err := NewBatch(int32(limit), int32(len(texts)))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = batch.Close() }()
-
-	out := make([][]float32, len(texts))
-	for start := 0; start < len(texts); {
-		end, nTokens := start, 0
-		for end < len(texts) && nTokens+len(tokens[end]) <= limit {
-			nTokens += len(tokens[end])
-			end++
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, wrap(ErrEmbedding, "embed", err)
-		}
-
-		batch.Reset()
-		for seq := start; seq < end; seq++ {
-			for pos, tok := range tokens[seq] {
-				if err := batch.Add(tok, int32(pos), []SeqID{int32(seq - start)}, true); err != nil {
-					return nil, err
-				}
-			}
-		}
-		C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
-		c.history = c.history[:0]
-		if err := c.decode(batch); err != nil {
-			return nil, err
-		}
-		for seq := start; seq < end; seq++ {
-			ptr := C.llama_get_embeddings_seq(c.ptr, C.llama_seq_id(seq-start))
-			if ptr == nil {
-				return nil, errorf(ErrEmbedding, "llama.cpp returned no embedding for sequence %d", seq-start)
-			}
-			out[seq] = copyEmbedding(ptr, nEmbd)
-		}
-		start = end
-	}
-	return out, nil
-}
-
-// embedSequential decodes one text at a time, which is the only way to read
-// per-token embeddings. Callers hold c.mu.
-func (c *Context) embedSequential(ctx context.Context, texts []string, nEmbd int) ([][]float32, error) {
 	out := make([][]float32, 0, len(texts))
-	for _, text := range texts {
+	for i, text := range texts {
 		if err := ctx.Err(); err != nil {
 			return out, wrap(ErrEmbedding, "embed", err)
 		}
 		vec, err := c.embedOne(text, nEmbd)
 		if err != nil {
+			if errors.Is(err, ErrEmbedding) {
+				return out, fmt.Errorf("%w (text %d)", err, i)
+			}
 			return out, err
 		}
 		out = append(out, vec)
@@ -181,8 +86,6 @@ func (c *Context) embedSequential(ctx context.Context, texts []string, nEmbd int
 	return out, nil
 }
 
-// embedOne embeds one text with pooling disabled and returns the hidden state of
-// its final token. Callers hold c.mu.
 func (c *Context) embedOne(text string, nEmbd int) ([]float32, error) {
 	tokens, err := c.model.vocab.Tokenize(text, true)
 	if err != nil {
@@ -194,31 +97,48 @@ func (c *Context) embedOne(text string, nEmbd int) ([]float32, error) {
 	if len(tokens) > c.nCtx {
 		return nil, errorf(ErrEmbedding, "input is %d tokens, context holds %d", len(tokens), c.nCtx)
 	}
+	// Pooling happens per micro-batch, so a text that spans more than one would
+	// come back as the pooled tail rather than the whole input.
+	if c.nUBatch > 0 && len(tokens) > c.nUBatch {
+		return nil, errorf(ErrEmbedding, "input is %d tokens but pooled embeddings need the whole text in one micro-batch of %d; raise ContextOptions.UBatchSize", len(tokens), c.nUBatch)
+	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ptr == nil {
+		return nil, ErrClosed
+	}
 	C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
 	c.history = c.history[:0]
 
-	// Embeddings need output on every token so every position is available,
-	// unlike generation which only needs the last one.
-	for start := 0; start < len(tokens); start += c.nBatch {
-		end := start + c.nBatch
-		if end > len(tokens) {
-			end = len(tokens)
-		}
-		if err := c.decodeRange(tokens[start:end], int32(start), false, true); err != nil {
-			return nil, err
-		}
+	// Embeddings need output on every token so the pooling stage can see the
+	// whole sequence, unlike generation which only needs the last position.
+	if err := c.decodeRange(tokens, 0, false, true); err != nil {
+		return nil, err
 	}
 
-	ptr := C.llama_get_embeddings_ith(c.ptr, C.int32_t(len(tokens)-1))
+	// The vector has to come from the same place the batched path reads it, or
+	// Embed and EmbedBatch answer with different things: a pooled model returns
+	// one vector per sequence, and only with pooling disabled is the last token's
+	// hidden state the answer.
+	var ptr *C.float
+	if c.poolingType() == PoolingNone {
+		ptr = C.llama_get_embeddings_ith(c.ptr, C.int32_t(len(tokens)-1))
+	} else {
+		ptr = C.llama_get_embeddings_seq(c.ptr, 0)
+	}
 	if ptr == nil {
-		return nil, errorf(ErrEmbedding, "llama.cpp returned no token embeddings (pooling none)")
+		return nil, errorf(ErrEmbedding, "llama.cpp returned no embeddings for a single text (pooling %s)", c.poolingType())
 	}
 	return copyEmbedding(ptr, nEmbd), nil
 }
 
-// copyEmbedding takes a copy of llama.cpp's buffer, which the next decode
-// overwrites.
+// poolingType reports the pooling mode llama.cpp resolved for this context, which
+// can differ from ContextOptions.Pooling when the model states its own default.
+func (c *Context) poolingType() PoolingType {
+	return PoolingType(int32(C.llama_pooling_type(c.ptr)))
+}
+
 func copyEmbedding(ptr *C.float, nEmbd int) []float32 {
 	raw := unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nEmbd)
 	vec := make([]float32, nEmbd)

@@ -55,11 +55,20 @@ func TestTokenizeDetokenizeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tokenize with addSpecial: %v", err)
 	}
-	if bos := v.BOS(); bos >= 0 {
-		if len(withBOS) != len(tokens)+1 || withBOS[0] != bos {
-			t.Fatalf("addSpecial=true gave %d tokens starting %d, want %d tokens starting with BOS %d",
-				len(withBOS), withBOS[0], len(tokens)+1, bos)
+	// Whether addSpecial actually adds anything is a property of the tokenizer:
+	// Qwen models have no BOS and leave the text untouched, Llama models prepend
+	// one. Accept either, but not something in between.
+	switch {
+	case len(withBOS) == len(tokens):
+		if len(tokens) > 0 && withBOS[0] != tokens[0] {
+			t.Fatalf("addSpecial=true changed the prompt without adding a token: %v vs %v", withBOS, tokens)
 		}
+	case len(withBOS) == len(tokens)+1:
+		if bos := v.BOS(); bos < 0 || withBOS[0] != bos {
+			t.Fatalf("addSpecial=true prepended %d, which is not the model BOS %d", withBOS[0], bos)
+		}
+	default:
+		t.Fatalf("addSpecial=true gave %d tokens, addSpecial=false gave %d", len(withBOS), len(tokens))
 	}
 }
 

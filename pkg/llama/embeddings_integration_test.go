@@ -125,16 +125,38 @@ func TestEmbedBatchMatchesSingleEmbedExactly(t *testing.T) {
 	}
 }
 
-func TestEmbedBatchNamesTheSequenceLimit(t *testing.T) {
+func TestEmbedBatchNeedsNoExtraSequences(t *testing.T) {
 	m := embedModel(t)
-	c := embedContext(t, m, ContextOptions{Embeddings: true, Pooling: PoolingMean, Sequences: 2})
+	// One sequence is enough now that each text gets its own decode.
+	c := embedContext(t, m, ContextOptions{Embeddings: true, Pooling: PoolingMean, Sequences: 1})
 
-	_, err := c.EmbedBatch(t.Context(), []string{"one", "two", "three"})
-	if !errors.Is(err, ErrEmbedding) {
-		t.Fatalf("EmbedBatch past the sequence limit = %v, want ErrEmbedding", err)
+	vecs, err := c.EmbedBatch(t.Context(), []string{"one", "two", "three"})
+	if err != nil {
+		t.Fatalf("EmbedBatch with one sequence = %v, want no error", err)
 	}
-	if !strings.Contains(err.Error(), "Sequences") {
-		t.Fatalf("error %q does not name the sequence limit", err)
+	if len(vecs) != 3 {
+		t.Fatalf("EmbedBatch returned %d vectors, want 3", len(vecs))
+	}
+	for i, v := range vecs {
+		if len(v) != m.EmbeddingSize() {
+			t.Fatalf("vector %d has %d dimensions, want %d", i, len(v), m.EmbeddingSize())
+		}
+	}
+}
+
+func TestEmbedRejectsTextLongerThanTheMicroBatch(t *testing.T) {
+	m := embedModel(t)
+	c := embedContext(t, m, ContextOptions{Embeddings: true, Pooling: PoolingMean, UBatchSize: 8})
+
+	// Pooling is per micro-batch, so a longer text would come back as the pooled
+	// tail of the input rather than the whole of it.
+	long := strings.Repeat("word ", 40)
+	_, err := c.Embed(t.Context(), long)
+	if !errors.Is(err, ErrEmbedding) {
+		t.Fatalf("Embed of a text longer than the micro-batch = %v, want ErrEmbedding", err)
+	}
+	if !strings.Contains(err.Error(), "UBatchSize") {
+		t.Fatalf("error %q does not name the knob to raise", err)
 	}
 }
 
