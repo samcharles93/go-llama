@@ -297,7 +297,11 @@ type Context struct {
 
 	mu      sync.Mutex
 	history []Token // tokens already in the KV cache, in order
-	closed  atomic.Bool
+	// logitsValid records whether the context holds output logits for the last
+	// cached position. Sampling without them reads whatever the buffer held,
+	// which after LoadState is not the prompt at all.
+	logitsValid bool
+	closed      atomic.Bool
 }
 
 // Model returns the model the context belongs to.
@@ -326,6 +330,7 @@ func (c *Context) Reset() error {
 	defer c.mu.Unlock()
 	C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
 	c.history = c.history[:0]
+	c.logitsValid = false
 	return nil
 }
 

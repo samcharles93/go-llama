@@ -348,3 +348,34 @@ func TestFitMessagesDropsOldestTurnsAndKeepsSystem(t *testing.T) {
 		t.Fatal("FitMessages with a zero budget returned no error")
 	}
 }
+
+func TestRestoredStateReproducesGreedyReply(t *testing.T) {
+	m := loadCoreModel(t)
+	const prompt = "Name three colours."
+	opts := GreedyCompletionOptions(6)
+
+	first := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	res1, err := first.Generate(context.Background(), prompt, opts)
+	if err != nil {
+		t.Fatalf("first Generate: %v", err)
+	}
+	state, err := first.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	// The saved state carries the KV cache but not the output logits, so a
+	// restored context that reuses its cache without decoding would sample from
+	// whatever the buffer held. Greedy decoding makes the divergence obvious.
+	second := newCoreContext(t, m, ContextOptions{ContextSize: 512, Threads: 4, ThreadsBatch: 4})
+	if err := second.LoadState(state); err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	res2, err := second.Generate(context.Background(), prompt, opts)
+	if err != nil {
+		t.Fatalf("Generate after LoadState: %v", err)
+	}
+	if res1.Text != res2.Text {
+		t.Fatalf("restored context produced %q, original produced %q", res2.Text, res1.Text)
+	}
+}

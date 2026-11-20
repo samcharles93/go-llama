@@ -54,6 +54,7 @@ func (c *Context) Truncate(keep int) error {
 	}
 	C.llama_memory_seq_rm(C.llama_get_memory(c.ptr), 0, C.llama_pos(keep), -1)
 	c.history = c.history[:keep]
+	c.logitsValid = false
 	return nil
 }
 
@@ -160,6 +161,8 @@ func (c *Context) LoadState(data []byte) error {
 		return errorf(ErrDecode, "llama_state_set_data accepted %d of %d bytes", n, len(state))
 	}
 	c.history = history
+	// A saved state carries the KV cache, not the output logits.
+	c.logitsValid = false
 	return nil
 }
 

@@ -273,6 +273,17 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 func (c *Context) syncKV(tokens []Token) (int, error) {
 	reused := commonPrefix(c.history, tokens)
 
+	// The caller is about to sample from the last position, so a decode has to
+	// have run for it. An exact cache hit normally skips decoding entirely, which
+	// is safe only while the logits from the previous decode are still current;
+	// after LoadState they are not.
+	if reused == len(tokens) && !c.logitsValid {
+		reused--
+		if reused < 0 {
+			reused = 0
+		}
+	}
+
 	if reused < len(c.history) {
 		// Recurrent and hybrid models keep one state per sequence rather than a
 		// cell per position, so llama.cpp refuses to drop their tail. Going
@@ -288,6 +299,7 @@ func (c *Context) syncKV(tokens []Token) (int, error) {
 			reused = 0
 		}
 		c.history = c.history[:reused]
+		c.logitsValid = false
 	}
 	if reused == len(tokens) {
 		return reused, nil
@@ -325,7 +337,11 @@ func (c *Context) decodeRange(tokens []Token, pos int32, logitsLast, logitsAll b
 			return err
 		}
 	}
-	return c.decode(b)
+	if err := c.decode(b); err != nil {
+		return err
+	}
+	c.logitsValid = logitsAll || logitsLast
+	return nil
 }
 
 // decodeOne evaluates a single already-cached token to get its logits.
@@ -338,7 +354,11 @@ func (c *Context) decodeOne(token Token, pos int32) error {
 	if err := b.AddOne(token, pos, true); err != nil {
 		return err
 	}
-	return c.decode(b)
+	if err := c.decode(b); err != nil {
+		return err
+	}
+	c.logitsValid = true
+	return nil
 }
 
 // scratchBatch returns the context's reusable batch, growing it when a call needs
@@ -381,6 +401,7 @@ func (c *Context) decode(b *Batch) error {
 	default:
 		C.llama_memory_clear(C.llama_get_memory(c.ptr), true)
 		c.history = c.history[:0]
+		c.logitsValid = false
 		return errorf(ErrDecode, "llama_decode failed with code %d; the context was reset", rc)
 	}
 }
