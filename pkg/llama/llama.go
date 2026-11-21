@@ -249,9 +249,13 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 	if o.Sequences > 0 {
 		cParams.n_seq_max = C.uint32_t(o.Sequences)
 	}
+	// llama.cpp's own default is a fixed 4 threads, which wastes a big machine
+	// and oversubscribes a small one, so zero means DefaultThreads here.
+	cParams.n_threads = C.int32_t(DefaultThreads())
 	if o.Threads > 0 {
 		cParams.n_threads = C.int32_t(o.Threads)
 	}
+	cParams.n_threads_batch = C.int32_t(DefaultThreads())
 	if o.ThreadsBatch > 0 {
 		cParams.n_threads_batch = C.int32_t(o.ThreadsBatch)
 	}
@@ -260,9 +264,7 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 	if o.Pooling != PoolingUnspecified {
 		cParams.pooling_type = C.enum_llama_pooling_type(o.Pooling)
 	}
-	if o.FlashAttention {
-		cParams.flash_attn_type = C.LLAMA_FLASH_ATTN_TYPE_AUTO
-	}
+	cParams.flash_attn_type = o.FlashAttention.llamaType()
 
 	ptr := C.llama_init_from_model(m.ptr, cParams)
 	if ptr == nil {
@@ -283,6 +285,7 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 		nUBatch:    nUBatch,
 		embeddings: o.Embeddings,
 		pooling:    o.Pooling,
+		flashAttn:  o.FlashAttention,
 	}
 	m.contexts++
 	return c, nil
@@ -300,6 +303,7 @@ type Context struct {
 	nUBatch    int
 	embeddings bool
 	pooling    PoolingType
+	flashAttn  FlashAttentionMode
 	batch      *Batch
 
 	mu      sync.Mutex
@@ -323,6 +327,43 @@ func (c *Context) BatchSize() int { return c.nBatch }
 // UBatchSize reports the micro-batch size, which is the longest text a pooled
 // embedding can see in one piece.
 func (c *Context) UBatchSize() int { return c.nUBatch }
+
+// Threads reports the thread counts llama.cpp uses for generation and for
+// batch (prompt) processing.
+func (c *Context) Threads() (generation, batch int32) {
+	if c == nil || c.closed.Load() {
+		return 0, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ptr == nil {
+		return 0, 0
+	}
+	return int32(C.llama_n_threads(c.ptr)), int32(C.llama_n_threads_batch(c.ptr))
+}
+
+// FlashAttention reports the flash attention mode the context was created with.
+func (c *Context) FlashAttention() FlashAttentionMode { return c.flashAttn }
+
+// llamaType maps the mode onto llama.cpp's enum. Auto is spelled out rather
+// than left to the default params so the mapping stays correct if llama.cpp
+// ever changes its default.
+func (m FlashAttentionMode) llamaType() C.enum_llama_flash_attn_type {
+	switch m {
+	case FlashAttentionOn:
+		return C.LLAMA_FLASH_ATTN_TYPE_ENABLED
+	case FlashAttentionOff:
+		return C.LLAMA_FLASH_ATTN_TYPE_DISABLED
+	default:
+		return C.LLAMA_FLASH_ATTN_TYPE_AUTO
+	}
+}
+
+// llamaName is llama.cpp's name for the mapped enum value, which lets a test
+// check the mapping without cgo in the test file.
+func (m FlashAttentionMode) llamaName() string {
+	return C.GoString(C.llama_flash_attn_type_name(m.llamaType()))
+}
 
 // TokenCount reports how many tokens currently occupy the KV cache.
 func (c *Context) TokenCount() int {

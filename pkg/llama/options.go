@@ -3,7 +3,6 @@ package llama
 import (
 	"fmt"
 	"math"
-	"runtime"
 )
 
 // PoolingType selects how token embeddings are reduced to one vector per
@@ -89,18 +88,20 @@ type ContextOptions struct {
 	UBatchSize uint32
 	// Sequences is the number of concurrent sequences the KV cache holds.
 	Sequences uint32
-	// Threads defaults to the number of CPUs nvcc and ggml were tuned for; 0
-	// leaves it to llama.cpp.
+	// Threads is the thread count for generating tokens. 0 picks
+	// DefaultThreads, not llama.cpp's fixed default of 4.
 	Threads int32
-	// ThreadsBatch is the thread count for batch and prompt processing.
+	// ThreadsBatch is the thread count for batch and prompt processing. 0
+	// picks DefaultThreads.
 	ThreadsBatch int32
 	// Embeddings turns on the embedding output path. Chat and embeddings
 	// cannot share a context.
 	Embeddings bool
 	// Pooling selects the embedding reduction mode.
 	Pooling PoolingType
-	// FlashAttention enables flash attention where the backend supports it.
-	FlashAttention bool
+	// FlashAttention selects when flash attention runs. The zero value lets
+	// llama.cpp enable it where the backend supports it.
+	FlashAttention FlashAttentionMode
 	// DisablePerf turns off llama.cpp's per-context timing counters, which
 	// costs a clock read per decode. Leave it off so Metrics is populated:
 	// llama_context_default_params sets no_perf true, so this package sets it
@@ -108,16 +109,41 @@ type ContextOptions struct {
 	DisablePerf bool
 }
 
+// FlashAttentionMode selects when a context uses flash attention.
+type FlashAttentionMode int8
+
+// Flash attention modes. Auto is the zero value so that an unset field keeps
+// llama.cpp's own default instead of silently turning the feature off.
+const (
+	// FlashAttentionAuto enables flash attention where the backend and the KV
+	// cache types support it.
+	FlashAttentionAuto FlashAttentionMode = iota
+	// FlashAttentionOn forces flash attention on.
+	FlashAttentionOn
+	// FlashAttentionOff disables flash attention.
+	FlashAttentionOff
+)
+
+func (m FlashAttentionMode) String() string {
+	switch m {
+	case FlashAttentionOn:
+		return "on"
+	case FlashAttentionOff:
+		return "off"
+	default:
+		return "auto"
+	}
+}
+
 // DefaultContextOptions returns a chat-ready context: the model's trained
-// window capped at MaxDefaultContextSize, threads matched to the machine, flash
-// attention on, and timings enabled.
+// window capped at MaxDefaultContextSize, threads matched to the machine's
+// performance cores, flash attention where supported, and timings enabled.
 func DefaultContextOptions() ContextOptions {
 	return ContextOptions{
-		Sequences:      1,
-		Pooling:        PoolingUnspecified,
-		FlashAttention: true,
-		Threads:        int32(runtime.NumCPU()),
-		ThreadsBatch:   int32(runtime.NumCPU()),
+		Sequences:    1,
+		Pooling:      PoolingUnspecified,
+		Threads:      DefaultThreads(),
+		ThreadsBatch: DefaultThreads(),
 	}
 }
 
