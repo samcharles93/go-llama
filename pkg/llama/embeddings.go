@@ -74,7 +74,7 @@ func (c *Context) EmbedBatch(ctx context.Context, texts []string) ([][]float32, 
 		if err := ctx.Err(); err != nil {
 			return out, wrap(ErrEmbedding, "embed", err)
 		}
-		vec, err := c.embedOne(text, nEmbd)
+		vec, err := c.embedOne(ctx, text, nEmbd)
 		if err != nil {
 			if errors.Is(err, ErrEmbedding) {
 				return out, fmt.Errorf("%w (text %d)", err, i)
@@ -86,7 +86,7 @@ func (c *Context) EmbedBatch(ctx context.Context, texts []string) ([][]float32, 
 	return out, nil
 }
 
-func (c *Context) embedOne(text string, nEmbd int) ([]float32, error) {
+func (c *Context) embedOne(ctx context.Context, text string, nEmbd int) ([]float32, error) {
 	tokens, err := c.model.vocab.Tokenize(text, true)
 	if err != nil {
 		return nil, err
@@ -113,7 +113,13 @@ func (c *Context) embedOne(text string, nEmbd int) ([]float32, error) {
 
 	// Embeddings need output on every token so the pooling stage can see the
 	// whole sequence, unlike generation which only needs the last position.
+	stopWatch := c.watchCancel(ctx)
+	defer stopWatch()
 	if err := c.decodeRange(tokens, 0, false, true); err != nil {
+		c.rollback(0)
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, wrap(ErrEmbedding, "embed", cerr)
+		}
 		return nil, err
 	}
 

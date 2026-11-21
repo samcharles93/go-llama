@@ -287,6 +287,10 @@ func (m *Model) NewContext(opts ...ContextOptions) (*Context, error) {
 		pooling:    o.Pooling,
 		flashAttn:  o.FlashAttention,
 	}
+	if err := c.installAbort(); err != nil {
+		C.llama_free(ptr)
+		return nil, err
+	}
 	m.contexts++
 	return c, nil
 }
@@ -305,6 +309,8 @@ type Context struct {
 	pooling    PoolingType
 	flashAttn  FlashAttentionMode
 	batch      *Batch
+	// abort is the C flag llama.cpp polls during graph compute; see abort.go.
+	abort unsafe.Pointer
 
 	mu      sync.Mutex
 	history []Token // tokens already in the KV cache, in order
@@ -399,6 +405,7 @@ func (c *Context) Close() error {
 		C.llama_free(c.ptr)
 		c.ptr = nil
 	}
+	c.freeAbort()
 	// The scratch batch holds C memory that llama_batch_free owns, so it has to
 	// go with the context.
 	if c.batch != nil {

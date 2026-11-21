@@ -175,10 +175,34 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 	defer func() { _ = sampler.Close() }()
 
 	C.llama_perf_context_reset(c.ptr)
-	reused, err := c.syncKV(tokens)
+	stopWatch := c.watchCancel(ctx)
+	defer stopWatch()
+
+	// finish fills in the fields every exit shares, so a cancelled, closed or
+	// failed generation reports the same partial result a completed one would.
+	var text strings.Builder
+	finish := func(reason StopReason, err error) (Result, error) {
+		if reason != StopReasonNone {
+			res.StopReason = reason
+		}
+		res.Text = text.String()
+		res.Metrics = c.metrics()
+		return res, err
+	}
+	// cancelled turns a decode failure caused by cancellation into the
+	// documented context.Canceled error. llama.cpp reports an abort as a plain
+	// status code, so the Go context is the only record of why it happened.
+	cancelled := func(err error) (Result, error) {
+		if cerr := ctx.Err(); cerr != nil {
+			return finish(StopReasonCancelled, wrap(ErrDecode, "generate", cerr))
+		}
+		return finish(StopReasonNone, err)
+	}
+
+	reused, err := c.syncKV(ctx, tokens)
 	res.ReusedTokens = reused
 	if err != nil {
-		return res, err
+		return cancelled(err)
 	}
 
 	stop := newStopMatcher(opts.Stop)
@@ -195,25 +219,19 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 	}
 	defer cands.free()
 
-	var text strings.Builder
 	for {
 		// Close sets the flag before waiting for the lock, so a reply long
 		// enough to outlive its owner stops here instead of blocking Close.
 		if c.closed.Load() {
-			res.StopReason = StopReasonCancelled
-			res.Text = text.String()
-			res.Metrics = c.metrics()
-			return res, ErrClosed
+			return finish(StopReasonCancelled, ErrClosed)
 		}
 		if err := ctx.Err(); err != nil {
-			res.StopReason = StopReasonCancelled
-			res.Metrics = c.metrics()
-			return res, wrap(ErrDecode, "generate", err)
+			return finish(StopReasonCancelled, wrap(ErrDecode, "generate", err))
 		}
 
 		token, serr := sampler.sampleWith(c, -1, cands)
 		if serr != nil {
-			return res, serr
+			return finish(StopReasonNone, serr)
 		}
 
 		// Stopping tokens are checked before Accept, the way llama.cpp's own
@@ -235,7 +253,7 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 
 		piece, perr := c.model.vocab.TokenToPiece(token)
 		if perr != nil {
-			return res, perr
+			return finish(StopReasonNone, perr)
 		}
 		res.Tokens = append(res.Tokens, token)
 
@@ -243,10 +261,7 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 		if out != "" {
 			text.WriteString(out)
 			if !emit(out) {
-				res.StopReason = StopReasonCancelled
-				res.Metrics = c.metrics()
-				res.Text = text.String()
-				return res, nil
+				return finish(StopReasonCancelled, nil)
 			}
 		}
 		if hit {
@@ -265,25 +280,28 @@ func (c *Context) generateTokens(ctx context.Context, tokens []Token, opts Compl
 
 		c.history = append(c.history, token)
 		if err := c.decodeOne(token, int32(len(c.history)-1)); err != nil {
-			return res, err
+			c.rollback(len(c.history) - 1)
+			return cancelled(err)
 		}
 	}
 
-	if res.StopReason != StopReasonStopSequence && res.StopReason != StopReasonCancelled {
+	if res.StopReason != StopReasonStopSequence {
 		if tail := stop.Flush(); tail != "" {
 			text.WriteString(tail)
 			emit(tail)
 		}
 	}
-	res.Text = text.String()
-	res.Metrics = c.metrics()
-	return res, nil
+	return finish(StopReasonNone, nil)
 }
 
 // syncKV aligns the KV cache with tokens, keeping the longest common prefix so a
 // multi-turn chat only evaluates the new turn instead of the whole
 // conversation.
-func (c *Context) syncKV(tokens []Token) (int, error) {
+//
+// A prompt longer than the batch size is decoded in chunks, and ctx is checked
+// between them, so cancellation interrupts a long prompt even on backends that
+// do not poll the abort flag mid-graph.
+func (c *Context) syncKV(ctx context.Context, tokens []Token) (int, error) {
 	reused := commonPrefix(c.history, tokens)
 
 	// The caller is about to sample from the last position, so a decode has to
@@ -322,16 +340,37 @@ func (c *Context) syncKV(tokens []Token) (int, error) {
 	}
 
 	for start := reused; start < len(tokens); start += c.nBatch {
-		end := start + c.nBatch
-		if end > len(tokens) {
-			end = len(tokens)
+		if err := ctx.Err(); err != nil {
+			return reused, wrap(ErrDecode, "evaluate prompt", err)
 		}
+		end := min(start+c.nBatch, len(tokens))
 		if err := c.decodeRange(tokens[start:end], int32(start), end == len(tokens), false); err != nil {
+			c.rollback(len(c.history))
 			return reused, err
 		}
 		c.history = append(c.history, tokens[start:end]...)
 	}
 	return reused, nil
+}
+
+// rollback makes the KV cache hold exactly the first n tokens of the history
+// again. A decode that fails part way, including one aborted by cancellation,
+// leaves the micro-batches it already processed in the cache; without this the
+// cache would hold positions the history does not know about, and the next
+// generation would decode on top of them.
+func (c *Context) rollback(n int) {
+	n = max(0, min(n, len(c.history)))
+	mem := C.llama_get_memory(c.ptr)
+	trimmed := false
+	if !c.model.IsRecurrent() && !c.model.IsHybrid() {
+		trimmed = bool(C.llama_memory_seq_rm(mem, 0, C.llama_pos(n), -1))
+	}
+	if !trimmed {
+		C.llama_memory_clear(mem, true)
+		n = 0
+	}
+	c.history = c.history[:n]
+	c.logitsValid = false
 }
 
 // decodeRange evaluates a slice of tokens starting at absolute position pos.
@@ -408,7 +447,7 @@ func (c *Context) decode(b *Batch) error {
 	case 1:
 		return errorf(ErrContextFull, "llama_decode found no KV cache slot for %d tokens (context holds %d)", b.Len(), c.nCtx)
 	case 2:
-		return errorf(ErrDecode, "llama_decode was aborted")
+		return errorf(ErrDecode, "llama_decode was aborted (context cancelled)")
 	case -1:
 		return errorf(ErrDecode, "llama_decode rejected the batch (invalid token id or position)")
 	default:
