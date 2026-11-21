@@ -312,6 +312,13 @@ KV cache first, which makes batch embedding of unrelated documents safe.
 
 ### Cancellation
 
+Cancelling the Go context stops generation at the next token, and also
+interrupts a long prompt evaluation: on the CPU and Metal backends llama.cpp
+polls an abort flag mid-decode, and on CUDA the prompt stops at the next batch
+boundary (`ContextOptions.BatchSize`). The partial `Result` comes back with an
+error satisfying `errors.Is(err, context.Canceled)`, and the context stays
+usable.
+
 ```go
 func cancel(path string) error {
 	model, err := llama.LoadModel(path)
@@ -524,6 +531,9 @@ Consequences worth knowing:
   context are serialised, but they share one KV cache and one token history, so
   each call sees whatever the other left behind. One context per conversation,
   or per in-flight request.
+- Zero `Threads` and `ThreadsBatch` mean `llama.DefaultThreads()`, one thread
+  per physical performance core, rather than `runtime.NumCPU()`: SMT siblings
+  and E-cores slow ggml down because every step waits for its slowest thread.
 - Parallelism means several contexts over one model. Each context allocates its
   own KV cache, which is where memory goes.
 - `Init` is idempotent and `LoadModel` calls it for you. `Shutdown` is a no-op

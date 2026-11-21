@@ -32,6 +32,7 @@ func run() error {
 	raw := flag.Bool("raw", false, "skip the chat template")
 	ctxSize := flag.Uint("ctx", 0, "KV cache size in tokens (0 = the smaller of the model window and 8192)")
 	ngl := flag.Int("ngl", -1, "GPU layers to offload (-1 offloads every layer when a GPU is present, 0 keeps the model on the CPU)")
+	threads := flag.Int("threads", 0, "CPU threads (0 = one per physical performance core)")
 	system := flag.String("system", "You are a helpful assistant.", "system prompt for the chat template")
 	flag.Parse()
 
@@ -51,7 +52,11 @@ func run() error {
 	}
 	defer func() { _ = model.Close() }()
 
-	ctx, err := model.NewContext(llama.ContextOptions{ContextSize: uint32(*ctxSize)})
+	ctx, err := model.NewContext(llama.ContextOptions{
+		ContextSize:  uint32(*ctxSize),
+		Threads:      int32(*threads),
+		ThreadsBatch: int32(*threads),
+	})
 	if err != nil {
 		return err
 	}
@@ -94,7 +99,8 @@ func run() error {
 		return genErr
 	}
 	m := ctx.Metrics()
-	fmt.Fprintf(os.Stderr, "\n[%d tokens in %.2fs, %.1f tok/s]\n",
-		m.GeneratedTokens, time.Since(start).Seconds(), m.TokensPerSecond())
+	gen, batch := ctx.Threads()
+	fmt.Fprintf(os.Stderr, "\n[%d tokens in %.2fs, %.1f tok/s, prompt %.1f tok/s, threads %d/%d]\n",
+		m.GeneratedTokens, time.Since(start).Seconds(), m.TokensPerSecond(), m.PromptTokensPerSecond(), gen, batch)
 	return nil
 }

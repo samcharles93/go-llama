@@ -9,6 +9,8 @@ llama.cpp source is a git submodule; the Go package links its shared libraries.
 pkg/llama/            the library
   cgo.go              the only place cgo compile/link flags are set
   llama.go            backend lifecycle, Model, Context
+  abort.go            C abort flag so cancellation interrupts llama_decode
+  threads*.go         DefaultThreads: one thread per physical performance core
   generate.go         Generate, Stream (iter.Seq2), KV-cache reuse
   batch.go            capacity-checked token batches
   sampler.go          sampler chains built from CompletionOptions, sampling
@@ -60,6 +62,15 @@ architecture instead of detecting the GPU.
   sharing one `Model`. Never call into a context without holding `c.mu`.
 - **KV reuse.** `generate` aligns the cache with the prompt via `syncKV`, keeping
   the longest common prefix, so a chat turn only evaluates the new tail.
+- **Cancellation reaches llama.cpp.** Each context owns a C atomic flag polled
+  by ggml's abort callback, raised by `watchCancel` while a generation or embed
+  runs. CPU and Metal poll it mid-graph; CUDA does not, so `syncKV` also checks
+  the Go context between prompt batches. A failed or aborted decode leaves
+  processed micro-batches in the cache, so callers `rollback` to the history.
+- **Threads.** Zero `Threads`/`ThreadsBatch` means `DefaultThreads`, never
+  llama.cpp's fixed 4. `runtime.NumCPU` oversubscribes SMT and E-cores.
+- **Flash attention** is a tri-state whose zero value is auto, because
+  llama.cpp's default is already auto and a bool could not turn it off.
 - **Errors.** Every failure wraps a sentinel from `errors.go`, so callers can use
   `errors.Is`. Cancellation surfaces as an error satisfying
   `errors.Is(err, context.Canceled)` while still returning the partial `Result`.
