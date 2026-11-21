@@ -125,8 +125,10 @@ func TestIntegrationSamplerDRYStage(t *testing.T) {
 		t.Fatalf("newSamplerFromOptions: %v", err)
 	}
 	defer s.Close()
+	// "?dry" is llama.cpp's name for a disabled DRY stage, which is what an
+	// unresolved -1 window builds.
 	if !slices.Contains(s.Stages(), "dry") {
-		t.Fatalf("stages = %v, want a dry stage", s.Stages())
+		t.Fatalf("stages = %v, want an enabled dry stage", s.Stages())
 	}
 	// The whole chain has to run, not just build.
 	if res := generateOnce(t, m, opts); len(res.Tokens) == 0 {

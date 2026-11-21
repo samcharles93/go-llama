@@ -299,6 +299,15 @@ func (o CompletionOptions) repeatLastN() int32 {
 	return o.RepeatLastN
 }
 
+// dryPenaltyLastN resolves DRY's window the same way: 0 means 64, -1 the whole
+// context.
+func (o CompletionOptions) dryPenaltyLastN() int32 {
+	if o.DryPenaltyLastN == 0 {
+		return 64
+	}
+	return o.DryPenaltyLastN
+}
+
 // xtcEnabled reports whether XTC would change anything. llama.cpp turns XTC
 // into a no-op when the probability is zero or the threshold is above 0.5, so
 // the stage is left out rather than added dead.

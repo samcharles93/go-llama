@@ -8,6 +8,7 @@ import "C"
 
 import (
 	"os"
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -16,16 +17,17 @@ import (
 // can be applied to several contexts of the same model, each with its own scale.
 //
 // The adapter is owned by the model: llama.cpp frees every adapter it created
-// when the model is freed, and llama_adapter_lora_free is deprecated in favour of
-// that. Close therefore drops this package's reference rather than freeing the C
-// object, and refuses while a context still has the adapter applied.
+// when the model is freed. Close drops this package's reference rather than
+// freeing the C object, so a model that is still loaded never holds a dangling
+// adapter, and it refuses while a context still has the adapter applied.
 type LoraAdapter struct {
 	ptr   *C.struct_llama_adapter_lora
 	model *Model
 	path  string
 
-	mu      sync.Mutex
-	closed  bool
+	mu     sync.Mutex
+	closed bool
+	// applied counts the contexts that have this adapter applied.
 	applied int
 }
 
@@ -51,8 +53,8 @@ func (m *Model) LoadLora(path string) (*LoraAdapter, error) {
 func (a *LoraAdapter) Path() string { return a.path }
 
 // Apply attaches the adapter to a context at the given scale, where 1 uses the
-// adapter as trained and 0 neutralises it. Applying the same adapter twice
-// replaces the previous scale rather than stacking another reference.
+// adapter as trained and 0 neutralises it. Applying the same adapter again
+// replaces its scale rather than stacking a second copy.
 func (a *LoraAdapter) Apply(c *Context, scale float32) error {
 	if a == nil || c == nil {
 		return ErrClosed
@@ -75,14 +77,24 @@ func (a *LoraAdapter) Apply(c *Context, scale float32) error {
 	if c.ptr == nil {
 		return ErrClosed
 	}
-	if rc := C.llama_set_adapter_lora(c.ptr, a.ptr, C.float(scale)); rc != 0 {
-		return errorf(ErrDecode, "llama_set_adapter_lora failed with code %d", rc)
+	next := slices.Clone(c.loras)
+	i := slices.IndexFunc(next, func(s loraSlot) bool { return s.adapter == a })
+	if i >= 0 {
+		next[i].scale = scale
+	} else {
+		next = append(next, loraSlot{adapter: a, scale: scale})
 	}
-	a.applied = min(a.applied+1, 1<<20)
+	if err := c.setLoras(next); err != nil {
+		return err
+	}
+	if i < 0 {
+		a.applied++
+	}
 	return nil
 }
 
-// Remove detaches the adapter from a context.
+// Remove detaches the adapter from a context. Removing an adapter that is not
+// applied there is a no-op.
 func (a *LoraAdapter) Remove(c *Context) error {
 	if a == nil || c == nil {
 		return ErrClosed
@@ -98,17 +110,18 @@ func (a *LoraAdapter) Remove(c *Context) error {
 	if c.ptr == nil {
 		return ErrClosed
 	}
-	if rc := C.llama_rm_adapter_lora(c.ptr, a.ptr); rc != 0 {
-		return errorf(ErrDecode, "llama_rm_adapter_lora failed with code %d", rc)
+	i := slices.IndexFunc(c.loras, func(s loraSlot) bool { return s.adapter == a })
+	if i < 0 {
+		return nil
 	}
-	if a.applied > 0 {
-		a.applied--
+	if err := c.setLoras(slices.Delete(slices.Clone(c.loras), i, i+1)); err != nil {
+		return err
 	}
+	a.applied--
 	return nil
 }
 
-// Applied reports how many Apply calls are outstanding. It is a coarse count: the
-// same adapter applied twice to one context counts twice.
+// Applied reports how many contexts currently have the adapter applied.
 func (a *LoraAdapter) Applied() int {
 	if a == nil {
 		return 0
@@ -124,12 +137,61 @@ func (c *Context) RemoveAllLoras() error {
 		return ErrClosed
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.ptr == nil {
+		c.mu.Unlock()
 		return ErrClosed
 	}
-	C.llama_clear_adapter_lora(c.ptr)
+	if err := c.setLoras(nil); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	dropped := c.loras
+	c.loras = nil
+	c.mu.Unlock()
+	releaseLoras(dropped)
 	return nil
+}
+
+// loraSlot is one adapter applied to a context.
+type loraSlot struct {
+	adapter *LoraAdapter
+	scale   float32
+}
+
+// setLoras hands llama.cpp the complete adapter list for the context, which is
+// the only form this llama.cpp accepts: llama_set_adapters_lora replaced the
+// per-adapter set, remove and clear calls. The caller holds c.mu, and c.loras
+// changes only when llama.cpp accepted the list.
+func (c *Context) setLoras(next []loraSlot) error {
+	ptrs := make([]*C.struct_llama_adapter_lora, len(next))
+	scales := make([]C.float, len(next))
+	for i, s := range next {
+		ptrs[i] = s.adapter.ptr
+		scales[i] = C.float(s.scale)
+	}
+	var pp **C.struct_llama_adapter_lora
+	var sp *C.float
+	if len(next) > 0 {
+		pp, sp = &ptrs[0], &scales[0]
+	}
+	if rc := C.llama_set_adapters_lora(c.ptr, pp, C.size_t(len(next)), sp); rc != 0 {
+		return errorf(ErrDecode, "llama_set_adapters_lora failed with code %d", rc)
+	}
+	c.loras = next
+	return nil
+}
+
+// releaseLoras drops a context's hold on adapters it no longer has applied. It
+// runs without c.mu, because Apply takes an adapter's lock before the
+// context's, and taking them in the other order here could deadlock.
+func releaseLoras(slots []loraSlot) {
+	for _, s := range slots {
+		s.adapter.mu.Lock()
+		if s.adapter.applied > 0 {
+			s.adapter.applied--
+		}
+		s.adapter.mu.Unlock()
+	}
 }
 
 // Close drops this package's reference to the adapter. It refuses while a context

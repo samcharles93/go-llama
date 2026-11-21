@@ -120,8 +120,7 @@ func LoadModel(path string, params ...ModelParams) (*Model, error) {
 	cParams := C.llama_model_default_params()
 	cParams.n_gpu_layers = C.int32_t(p.GPULayers)
 	cParams.main_gpu = C.int32_t(p.MainGPU)
-	cParams.use_mmap = C.bool(p.UseMmap)
-	cParams.use_mlock = C.bool(p.UseMlock)
+	cParams.load_mode = p.loadMode()
 	cParams.vocab_only = C.bool(p.VocabOnly)
 
 	cPath := C.CString(path)
@@ -311,6 +310,9 @@ type Context struct {
 	batch      *Batch
 	// abort is the C flag llama.cpp polls during graph compute; see abort.go.
 	abort unsafe.Pointer
+	// loras is the adapter list llama.cpp has for this context, kept here
+	// because llama_set_adapters_lora only takes the whole list.
+	loras []loraSlot
 
 	mu      sync.Mutex
 	history []Token // tokens already in the KV cache, in order
@@ -350,6 +352,26 @@ func (c *Context) Threads() (generation, batch int32) {
 
 // FlashAttention reports the flash attention mode the context was created with.
 func (c *Context) FlashAttention() FlashAttentionMode { return c.flashAttn }
+
+// loadMode maps the mmap and mlock switches onto llama.cpp's load_mode enum,
+// which replaced the separate use_mmap and use_mlock fields.
+func (p ModelParams) loadMode() C.enum_llama_load_mode {
+	switch {
+	case p.UseMmap && p.UseMlock:
+		return C.LLAMA_LOAD_MODE_MMAP_MLOCK
+	case p.UseMmap:
+		return C.LLAMA_LOAD_MODE_MMAP
+	case p.UseMlock:
+		return C.LLAMA_LOAD_MODE_MLOCK
+	default:
+		return C.LLAMA_LOAD_MODE_NONE
+	}
+}
+
+// loadModeName is llama.cpp's name for the mapped load mode, for tests.
+func (p ModelParams) loadModeName() string {
+	return C.GoString(C.llama_load_mode_name(p.loadMode()))
+}
 
 // llamaType maps the mode onto llama.cpp's enum. Auto is spelled out rather
 // than left to the default params so the mapping stays correct if llama.cpp
@@ -412,7 +434,10 @@ func (c *Context) Close() error {
 		_ = c.batch.Close()
 		c.batch = nil
 	}
+	dropped := c.loras
+	c.loras = nil
 	c.mu.Unlock()
+	releaseLoras(dropped)
 
 	if c.model != nil {
 		c.model.mu.Lock()

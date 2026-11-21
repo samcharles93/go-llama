@@ -102,7 +102,8 @@ func newSamplerFromOptions(vocab *Vocab, opts CompletionOptions) (_ *Sampler, er
 			repeat = 1
 		}
 		if err := s.add(C.llama_sampler_init_penalties(
-			C.int32_t(opts.repeatLastN()), C.float(repeat), C.float(opts.FrequencyPenalty), C.float(opts.PresencePenalty),
+			C.int32_t(vocabSize(vocab)), C.int32_t(resolveWindow(opts.repeatLastN(), vocab)),
+			C.float(repeat), C.float(opts.FrequencyPenalty), C.float(opts.PresencePenalty),
 		), ErrDecode); err != nil {
 			return nil, err
 		}
@@ -181,8 +182,7 @@ func (s *Sampler) add(stage *C.struct_llama_sampler, kind error) error {
 }
 
 // addDry appends the DRY stage. DRY tokenises its sequence breakers against the
-// vocabulary and uses the trained context size to resolve a -1 window, so it
-// cannot be built without a model.
+// vocabulary, so it cannot be built without a model.
 func (s *Sampler) addDry(vocab *Vocab, opts CompletionOptions) error {
 	if vocab == nil || vocab.vocab == nil {
 		return errorf(ErrDecode, "DRY needs the model vocabulary")
@@ -198,23 +198,34 @@ func (s *Sampler) addDry(vocab *Vocab, opts CompletionOptions) error {
 		}
 	}()
 
-	nCtxTrain := 0
-	if vocab.model != nil {
-		nCtxTrain = int(C.llama_model_n_ctx_train(vocab.model))
-	}
-
 	var breakerPtr **C.char
 	if len(breakers) > 0 {
 		breakerPtr = (**C.char)(unsafe.Pointer(&breakers[0]))
 	}
 
 	stage := C.llama_sampler_init_dry(
-		vocab.vocab, C.int32_t(nCtxTrain),
+		vocab.vocab,
 		C.float(opts.DryMultiplier), C.float(opts.dryBase()),
-		C.int32_t(opts.dryAllowedLength()), C.int32_t(opts.repeatLastN()),
+		C.int32_t(opts.dryAllowedLength()), C.int32_t(resolveWindow(opts.dryPenaltyLastN(), vocab)),
 		breakerPtr, C.size_t(len(breakers)),
 	)
 	return s.add(stage, ErrDecode)
+}
+
+// resolveWindow turns a penalty window into the count llama.cpp expects. This
+// llama.cpp clamps a negative window to 0, which disables the stage, so the
+// documented -1 for "the whole context" is resolved here: to the model's
+// trained context, or MaxDefaultContextSize when there is no model to ask.
+func resolveWindow(n int32, vocab *Vocab) int32 {
+	if n >= 0 {
+		return n
+	}
+	if vocab != nil && vocab.model != nil {
+		if train := int32(C.llama_model_n_ctx_train(vocab.model)); train > 0 {
+			return train
+		}
+	}
+	return int32(MaxDefaultContextSize)
 }
 
 // vocabSize reports the vocabulary size, or 0 when there is no model to ask.
@@ -351,8 +362,11 @@ func (s *Sampler) AddPenalties(lastN int32, repeat, frequency, presence float32)
 	if lastN == 0 {
 		lastN = 64
 	}
+	// A chain built by hand has no model, so "whole context" falls back to
+	// MaxDefaultContextSize, and n_vocab, which only sizes llama.cpp's
+	// GPU-side sampling path, is left at 0.
 	C.llama_sampler_chain_add(s.sampler,
-		C.llama_sampler_init_penalties(C.int32_t(lastN), C.float(repeat), C.float(frequency), C.float(presence)))
+		C.llama_sampler_init_penalties(0, C.int32_t(resolveWindow(lastN, nil)), C.float(repeat), C.float(frequency), C.float(presence)))
 	return s
 }
 
